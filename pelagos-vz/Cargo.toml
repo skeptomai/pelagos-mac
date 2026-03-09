@@ -1,0 +1,17 @@
+[package]
+name = "pelagos-vz"
+version.workspace = true
+edition.workspace = true
+description = "Apple Virtualization Framework bindings for pelagos-mac"
+
+# macOS only — will not compile on Linux
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["all"] }
+objc2-virtualization = { version = "0.2", features = ["all"] }
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true

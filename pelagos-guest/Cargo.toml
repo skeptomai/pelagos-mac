@@ -1,0 +1,19 @@
+[package]
+name = "pelagos-guest"
+version.workspace = true
+edition.workspace = true
+description = "Guest daemon — runs inside the pelagos-mac Linux VM, receives commands over vsock"
+
+# Cross-compiled to aarch64-unknown-linux-gnu and baked into the VM disk image.
+# Build with: cargo build --target aarch64-unknown-linux-gnu --release -p pelagos-guest
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+# vsock on Linux: AF_VSOCK via nix
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["net", "process", "signal"] }
+libc = "*"

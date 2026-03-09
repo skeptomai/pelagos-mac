@@ -1,0 +1,6 @@
+target/
+*.img
+*.qcow2
+*.raw
+Cargo.lock
+.DS_Store

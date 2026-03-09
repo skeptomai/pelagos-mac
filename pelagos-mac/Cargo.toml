@@ -1,0 +1,18 @@
+[package]
+name = "pelagos-mac"
+version.workspace = true
+edition.workspace = true
+description = "pelagos container runtime for Apple Silicon — macOS CLI"
+
+[[bin]]
+name = "pelagos"
+path = "src/main.rs"
+
+[dependencies]
+pelagos-vz = { path = "../pelagos-vz" }
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+thiserror.workspace = true
+clap = { version = "3", features = ["derive"] }
