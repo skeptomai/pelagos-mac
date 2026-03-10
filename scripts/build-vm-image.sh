@@ -40,6 +40,10 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
+PELAGOS_VERSION="0.24.0"
+PELAGOS_BIN="$WORK/pelagos-aarch64-linux"
+PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
+
 # ---------------------------------------------------------------------------
 echo "[1/6] Setting up output directories"
 # ---------------------------------------------------------------------------
@@ -115,7 +119,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[4/6] Building pelagos-guest (cross-compile)"
+echo "[4/7] Building pelagos-guest (cross-compile)"
 # ---------------------------------------------------------------------------
 if [ ! -f "$GUEST_BIN" ]; then
     echo "  Cross-compiling pelagos-guest for aarch64-unknown-linux-gnu..."
@@ -137,7 +141,18 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[5/6] Building custom initramfs"
+echo "[5/7] Downloading pelagos runtime binary (v${PELAGOS_VERSION})"
+# ---------------------------------------------------------------------------
+if [ ! -f "$PELAGOS_BIN" ]; then
+    curl -L --progress-bar -o "$PELAGOS_BIN" "$PELAGOS_URL"
+    chmod 755 "$PELAGOS_BIN"
+    echo "  Downloaded: $PELAGOS_BIN"
+else
+    echo "  (cached: $PELAGOS_BIN)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "[6/7] Building custom initramfs"
 # ---------------------------------------------------------------------------
 if [ ! -f "$INITRAMFS_OUT" ]; then
     KVER="6.12.1-3-virt"
@@ -178,10 +193,12 @@ if [ ! -f "$INITRAMFS_OUT" ]; then
     # Ensure kernel vfs mountpoints exist (Alpine initramfs may already have them).
     mkdir -p "$INITRD_TMP/proc" "$INITRD_TMP/sys" "$INITRD_TMP/dev"
 
-    # Add guest daemon
+    # Add guest daemon and pelagos runtime.
     mkdir -p "$INITRD_TMP/usr/local/bin"
     cp "$GUEST_BIN" "$INITRD_TMP/usr/local/bin/pelagos-guest"
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-guest"
+    cp "$PELAGOS_BIN" "$INITRD_TMP/usr/local/bin/pelagos"
+    chmod 755 "$INITRD_TMP/usr/local/bin/pelagos"
 
     # Replace /init: mounts vfs, loads vsock modules, execs pelagos-guest.
     # Without root= in cmdline the kernel uses the initramfs as root and runs /init.
@@ -210,6 +227,9 @@ busybox mkdir -p /etc
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
 
+export PELAGOS_IMAGE_STORE=/run/pelagos
+busybox mkdir -p /run/pelagos
+
 exec /usr/local/bin/pelagos-guest
 INIT_EOF
     chmod 755 "$INITRD_TMP/init"
@@ -223,7 +243,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[6/6] Creating placeholder disk image"
+echo "[7/7] Creating placeholder disk image"
 # ---------------------------------------------------------------------------
 if [ ! -f "$DISK_IMG" ]; then
     # AVF requires at least one block device in the VM config.
