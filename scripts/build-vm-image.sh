@@ -21,7 +21,8 @@
 #   out/initramfs-custom.gz   — Alpine initramfs + pelagos additions
 #   out/root.img              — 64 MiB placeholder disk
 #
-# Kernel cmdline to use:  console=hvc0 rdinit=/pelagos-init
+# Kernel cmdline to use:  console=hvc0
+# (the kernel's default rdinit=/init picks up our /init from the initramfs)
 
 set -euo pipefail
 
