@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-10, commit 9ef9ee9*
+*Last updated: 2026-03-10, post-Phase-1*
 
 ---
 
@@ -175,7 +175,7 @@ if fd < 0 {
 
 ---
 
-## Phase 1 — `pelagos run` End-to-End (Epic #10)
+## Phase 1 — `pelagos run` End-to-End (Epic #10) ✅
 
 ### Task 1.1 — ✅ VM init: kernel filesystem mounts (#11, PR #15)
 
@@ -200,22 +200,25 @@ Added unit tests covering `GuestCommand::Run`/`Ping` serialization and
 `GuestResponse::Stream`/`Exit`/`Pong` deserialization. The `run_command` function
 was already implemented in `pelagos-mac/src/main.rs`.
 
-**Next step: rebuild the VM image and test end-to-end:**
+**End-to-end verified:** `pelagos run alpine /bin/echo hello` outputs `hello`, confirmed
+twice in a row on real hardware (2026-03-10).
 
-```bash
-# Delete cached initramfs to force rebuild with new binaries:
-rm -f out/initramfs-custom.gz out/work/pelagos-aarch64-linux
-
-bash scripts/build-vm-image.sh
-
-codesign --sign - --entitlements pelagos-mac/entitlements.plist --force \
-    target/aarch64-apple-darwin/release/pelagos
-
-RUST_LOG=info ./target/aarch64-apple-darwin/release/pelagos \
-    --kernel out/vmlinuz --initrd out/initramfs-custom.gz --disk out/root.img \
-    --cmdline 'console=hvc0' run alpine /bin/echo hello
-# → hello
-```
+**Key bugs discovered and fixed during Phase 1:**
+- `pelagos run` does not auto-pull — `pelagos-guest` now calls `pelagos image pull`
+  first, streams its output back as stderr, checks exit status.
+- `CONFIG_PACKET=n` in Alpine virt kernel — `busybox udhcpc` cannot use raw sockets;
+  switched to static IP (`192.168.64.2/24`, gateway `192.168.64.1`) since AVF NAT
+  always uses `192.168.64.0/24`.
+- `virtio_net.ko` not built into Alpine virt kernel — loads `failover.ko`,
+  `net_failover.ko`, `virtio_net.ko` from modloop in `/init`.
+- `/tmp` missing — pelagos writes temp files during OCI layer download; added
+  `busybox mount -t tmpfs tmpfs /tmp` to init.
+- CA bundle missing — static musl binary needs `/etc/ssl/certs/ca-certificates.crt`;
+  sourced from `/opt/homebrew/share/ca-certificates/cacert.pem` at build time.
+- `com.apple.vm.networking` entitlement — private/restricted Apple entitlement; using
+  it with ad-hoc signing causes macOS to SIGKILL the process (exit 137). Not used.
+- AVF NAT warmup race — pelagos's first outbound TCP connection races with NAT
+  initialization; fixed by pinging 8.8.8.8 in init before exec'ing pelagos-guest.
 
 ---
 
@@ -239,7 +242,7 @@ RUST_LOG=info ./target/aarch64-apple-darwin/release/pelagos \
 - vsock connect: `VZVirtioSocketDevice::connectToPort_completionHandler` connects
   host→guest. The guest must be listening before the host connects — `connect_vsock()`
   includes a 30-attempt retry loop with 1-second backoff.
-- virtiofsd (host side) not yet wired in — Phase 1 item.
+- virtiofsd (host side) not yet wired in — Phase 2 item.
 - macOS 13.5+ required for full feature set.
 - The `com.apple.security.virtualization` entitlement is required at runtime; the
   binary must be signed before execution.

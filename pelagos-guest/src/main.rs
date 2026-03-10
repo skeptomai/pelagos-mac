@@ -132,10 +132,59 @@ fn run_container(
 ) -> std::io::Result<()> {
     let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
 
+    // Pull the image before running — pelagos run does not auto-pull.
+    let mut pull = match Command::new(&pelagos)
+        .arg("image")
+        .arg("pull")
+        .arg(image)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("image pull spawn failed: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+    // Collect pull output and relay it line-by-line as stderr stream.
+    let pull_stderr = pull.stderr.take().unwrap();
+    let pull_stdout = pull.stdout.take().unwrap();
+    for l in BufReader::new(pull_stderr)
+        .lines()
+        .chain(BufReader::new(pull_stdout).lines())
+        .flatten()
+    {
+        send_response(
+            writer,
+            &GuestResponse::Stream {
+                stream: StreamKind::Stderr,
+                data: l + "\n",
+            },
+        )?;
+    }
+    let pull_status = pull.wait()?;
+    if !pull_status.success() {
+        send_response(
+            writer,
+            &GuestResponse::Error {
+                error: format!(
+                    "image pull failed (exit {})",
+                    pull_status.code().unwrap_or(-1)
+                ),
+            },
+        )?;
+        return Ok(());
+    }
+
     let mut cmd = Command::new(&pelagos);
     cmd.arg("run").arg(image);
     if !args.is_empty() {
-        cmd.arg("--");
         cmd.args(args);
     }
     for (k, v) in env {

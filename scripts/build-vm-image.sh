@@ -44,13 +44,19 @@ PELAGOS_VERSION="0.24.0"
 PELAGOS_BIN="$WORK/pelagos-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 
+# Mozilla CA bundle — needed by the statically-linked musl pelagos binary for TLS.
+# Prefer the Homebrew-managed bundle; fall back to downloading from curl.se.
+CA_BUNDLE_SRC="/opt/homebrew/share/ca-certificates/cacert.pem"
+CA_BUNDLE_URL="https://curl.se/ca/cacert.pem"
+CA_BUNDLE="$WORK/cacert.pem"
+
 # ---------------------------------------------------------------------------
-echo "[1/6] Setting up output directories"
+echo "[1/8] Setting up output directories"
 # ---------------------------------------------------------------------------
 mkdir -p "$OUT" "$WORK"
 
 # ---------------------------------------------------------------------------
-echo "[2/6] Downloading Alpine virt ISO ($ALPINE_VERSION $ALPINE_ARCH)"
+echo "[2/8] Downloading Alpine virt ISO ($ALPINE_VERSION $ALPINE_ARCH)"
 # ---------------------------------------------------------------------------
 if [ ! -f "$WORK/$ALPINE_ISO" ]; then
     curl -L --progress-bar -o "$WORK/$ALPINE_ISO" "$ALPINE_URL"
@@ -59,7 +65,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[3/6] Extracting kernel and initramfs from ISO"
+echo "[3/8] Extracting kernel and initramfs from ISO"
 # ---------------------------------------------------------------------------
 if [ ! -f "$KERNEL_OUT" ] || [ ! -f "$WORK/initramfs-virt" ]; then
     # bsdtar (libarchive, ships with macOS) reads ISO 9660 natively — no mount needed.
@@ -119,7 +125,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[4/7] Building pelagos-guest (cross-compile)"
+echo "[4/8] Building pelagos-guest (cross-compile)"
 # ---------------------------------------------------------------------------
 if [ ! -f "$GUEST_BIN" ]; then
     echo "  Cross-compiling pelagos-guest for aarch64-unknown-linux-gnu..."
@@ -141,7 +147,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[5/7] Downloading pelagos runtime binary (v${PELAGOS_VERSION})"
+echo "[5/8] Downloading pelagos runtime binary (v${PELAGOS_VERSION})"
 # ---------------------------------------------------------------------------
 if [ ! -f "$PELAGOS_BIN" ]; then
     curl -L --progress-bar -o "$PELAGOS_BIN" "$PELAGOS_URL"
@@ -152,7 +158,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[6/7] Building custom initramfs"
+echo "[6/8] Staging Mozilla CA bundle (for TLS inside VM)"
+# ---------------------------------------------------------------------------
+if [ ! -f "$CA_BUNDLE" ]; then
+    if [ -f "$CA_BUNDLE_SRC" ]; then
+        cp "$CA_BUNDLE_SRC" "$CA_BUNDLE"
+        echo "  Copied from Homebrew: $CA_BUNDLE"
+    else
+        curl -L --progress-bar -o "$CA_BUNDLE" "$CA_BUNDLE_URL"
+        echo "  Downloaded: $CA_BUNDLE"
+    fi
+else
+    echo "  (cached: $CA_BUNDLE)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "[7/8] Building custom initramfs"
 # ---------------------------------------------------------------------------
 if [ ! -f "$INITRAMFS_OUT" ]; then
     KVER="6.12.1-3-virt"
@@ -190,6 +211,26 @@ if [ ! -f "$INITRAMFS_OUT" ]; then
         fi
     done
 
+    # Add virtio-net and virtio-rng modules (not built into the Alpine virt kernel).
+    # virtio-net load order: failover → net_failover → virtio_net
+    # virtio-rng load order: rng-core → virtio-rng
+    NETMOD_BASE="$MODLOOP_DIR/modules/$KVER/kernel"
+    for src_path in \
+        "$NETMOD_BASE/net/core/failover.ko" \
+        "$NETMOD_BASE/drivers/net/net_failover.ko" \
+        "$NETMOD_BASE/drivers/net/virtio_net.ko" \
+        "$NETMOD_BASE/drivers/char/hw_random/rng-core.ko" \
+        "$NETMOD_BASE/drivers/char/hw_random/virtio-rng.ko"
+    do
+        dst_dir="$INITRD_TMP/lib/modules/$KVER/$(dirname "${src_path#$NETMOD_BASE/}")"
+        mkdir -p "$dst_dir"
+        if [ -f "$src_path" ]; then
+            cp "$src_path" "$dst_dir/"
+        else
+            echo "  WARNING: $(basename $src_path) not found" >&2
+        fi
+    done
+
     # Ensure kernel vfs mountpoints exist (Alpine initramfs may already have them).
     mkdir -p "$INITRD_TMP/proc" "$INITRD_TMP/sys" "$INITRD_TMP/dev"
 
@@ -199,6 +240,29 @@ if [ ! -f "$INITRAMFS_OUT" ]; then
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos-guest"
     cp "$PELAGOS_BIN" "$INITRD_TMP/usr/local/bin/pelagos"
     chmod 755 "$INITRD_TMP/usr/local/bin/pelagos"
+
+    # Write a udhcpc default script so DHCP can configure the interface and default route.
+    # Without this script, udhcpc obtains a lease but never applies it (no ip addr, no route).
+    mkdir -p "$INITRD_TMP/usr/share/udhcpc"
+    cat > "$INITRD_TMP/usr/share/udhcpc/default.script" << 'UDHCPC'
+#!/bin/sh
+case "$1" in
+    bound|renew)
+        busybox ip addr flush dev "$interface"
+        busybox ip addr add "$ip/$mask" dev "$interface"
+        [ -n "$router" ] && busybox ip route add default via "$router" dev "$interface"
+        ;;
+    deconfig)
+        busybox ip addr flush dev "$interface"
+        ;;
+esac
+UDHCPC
+    chmod 755 "$INITRD_TMP/usr/share/udhcpc/default.script"
+
+    # Install Mozilla CA bundle so the statically-linked musl pelagos binary
+    # can verify TLS certificates when pulling OCI images from Docker Hub.
+    mkdir -p "$INITRD_TMP/etc/ssl/certs"
+    cp "$CA_BUNDLE" "$INITRD_TMP/etc/ssl/certs/ca-certificates.crt"
 
     # Replace /init: mounts vfs, loads vsock modules, execs pelagos-guest.
     # Without root= in cmdline the kernel uses the initramfs as root and runs /init.
@@ -212,23 +276,41 @@ busybox mount -t sysfs    sysfs    /sys 2>/dev/null || true
 busybox mkdir -p /sys/fs/cgroup
 busybox mount -t cgroup2  cgroup2  /sys/fs/cgroup 2>/dev/null || true
 
+# Load virtio-rng early so the kernel CSPRNG is seeded before TLS is attempted.
+busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/rng-core.ko 2>/dev/null || true
+busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/virtio-rng.ko 2>/dev/null || true
+
 # Load vsock kernel modules.
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/null || true
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/null || true
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/null || true
 
-# Configure networking: bring up lo and eth0 via DHCP.
-# AVF provides a NAT device as eth0; busybox udhcpc obtains an address from it.
-busybox ip link set lo up 2>/dev/null || true
-busybox ip link set eth0 up 2>/dev/null || true
-busybox udhcpc -i eth0 -f -q 2>/dev/null || true
+# Load virtio-net modules (not built into the Alpine virt kernel).
+busybox insmod /lib/modules/$KVER/kernel/net/core/failover.ko 2>/dev/null || true
+busybox insmod /lib/modules/$KVER/kernel/drivers/net/net_failover.ko 2>/dev/null || true
+busybox insmod /lib/modules/$KVER/kernel/drivers/net/virtio_net.ko 2>/dev/null || true
+
+# Configure networking: static IP on the AVF NAT subnet (192.168.64.0/24).
+# The Alpine virt kernel lacks AF_PACKET support (CONFIG_PACKET=n), so udhcpc
+# cannot be used. AVF NAT always uses 192.168.64.0/24 with gateway .1.
+busybox ip link set lo up
+busybox ip link set eth0 up
+busybox ip addr add 192.168.64.2/24 dev eth0
+busybox ip route add default via 192.168.64.1
+echo "[pelagos-init] network ready"
 # Write a minimal resolv.conf so DNS resolution works inside the VM.
 busybox mkdir -p /etc
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 echo 'nameserver 8.8.4.4' >> /etc/resolv.conf
 
+busybox mkdir -p /tmp /run /run/pelagos
+busybox mount -t tmpfs tmpfs /tmp
+
+# Wait for the AVF NAT to be ready for outbound TCP connections.
+# Without this, the first connect() to Docker Hub races with NAT initialization.
+busybox ping -c 3 -W 5 -q 8.8.8.8 >/dev/null 2>&1 || true
+
 export PELAGOS_IMAGE_STORE=/run/pelagos
-busybox mkdir -p /run/pelagos
 
 exec /usr/local/bin/pelagos-guest
 INIT_EOF
@@ -243,7 +325,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "[7/7] Creating placeholder disk image"
+echo "[8/8] Creating placeholder disk image"
 # ---------------------------------------------------------------------------
 if [ ! -f "$DISK_IMG" ]; then
     # AVF requires at least one block device in the VM config.
