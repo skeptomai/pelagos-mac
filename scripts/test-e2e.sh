@@ -16,12 +16,13 @@
 #   still warm from the previous session.  In this state the ping gate inside
 #   the VM succeeds on the first try (~100 ms) so the total cold start is
 #   ~1-2 s.  On a truly fresh macOS login the first boot can take up to ~50 s
-#   while the ping gate waits for NAT to come up.  If that happens, run:
-#     sudo pfctl -f /etc/pf.conf
-#   to reset PF and let InternetSharing re-establish cleanly.
+#   while the ping gate waits for NAT to come up.
 #
-# If image pulls fail with "error sending request", PF state has degraded.
-# Fix with: sudo pfctl -f /etc/pf.conf
+# If image pulls fail with "error sending request", NAT state has degraded.
+# Check ~/.local/share/pelagos/daemon.log for ICMP/TCP probe results.
+# macOS 26+: sudo launchctl kickstart -k system/com.apple.NetworkSharing
+# macOS 13-15: sudo pfctl -f /etc/pf.conf
+# If neither works: reboot.
 
 set -uo pipefail
 
@@ -337,7 +338,8 @@ if [ "$FAIL" -eq 0 ]; then
 else
     echo "FAIL  ($FAIL failed, $PASS passed)"
     echo ""
-    echo "If image pulls are failing with 'error sending request', PF state"
-    echo "has degraded. Fix with:  sudo pfctl -f /etc/pf.conf"
+    echo "If image pulls are failing with 'error sending request', NAT state"
+    echo "has degraded. macOS 26+: sudo launchctl kickstart -k system/com.apple.NetworkSharing"
+    echo "macOS 13-15: sudo pfctl -f /etc/pf.conf  |  If neither works: reboot."
     exit 1
 fi

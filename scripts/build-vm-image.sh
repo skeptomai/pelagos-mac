@@ -303,11 +303,25 @@ busybox mount -t tmpfs tmpfs /tmp
 # then exit immediately. Exits in ~1-2s when the AVF NAT is ready on first
 # attempt; waits up to 30s if it takes longer. Without this gate, pelagos's
 # first outbound TCP connection races with NAT initialization and fails.
+ICMP_OK=0
 i=0
 while [ \$i -lt 15 ]; do
-    busybox ping -c 1 -W 3 -q 8.8.8.8 >/dev/null 2>&1 && break
+    if busybox ping -c 1 -W 3 -q 8.8.8.8 >/dev/null 2>&1; then
+        ICMP_OK=1
+        break
+    fi
     i=\$((i+1))
 done
+echo "[pelagos-init] ICMP 8.8.8.8: \$([ \$ICMP_OK -eq 1 ] && echo OK || echo FAILED)"
+
+# Probe TCP connectivity: open a TCP connection to 1.1.1.1:443.
+# ICMP can succeed even when PF NAT is degraded (TCP fails).
+# This probe is printed to the console (daemon.log) for diagnostics.
+if busybox nc -w 3 1.1.1.1 443 </dev/null >/dev/null 2>&1; then
+    echo "[pelagos-init] TCP 1.1.1.1:443: OK"
+else
+    echo "[pelagos-init] TCP 1.1.1.1:443: FAILED (PF/NAT may be degraded; run: sudo pfctl -f /etc/pf.conf)"
+fi
 
 # Mount virtiofs shares requested by the host.
 # The host appends "virtiofs.tags=share0,share1,..." to the kernel cmdline

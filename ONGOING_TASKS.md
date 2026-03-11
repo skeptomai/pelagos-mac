@@ -247,27 +247,32 @@ twice in a row on real hardware (2026-03-10).
 - The `com.apple.security.virtualization` entitlement is required at runtime; the
   binary must be signed before execution.
 
-### ⚠️ Known: PF/NAT state degrades after ~5 VM runs (issue #26)
+### ⚠️ Known: NAT state degrades after ~5 VM runs (issue #26)
 
-`VZNATNetworkDeviceAttachment` uses macOS `InternetSharing` to manage `bridge100`
-and install packet-filter (PF) NAT masquerade rules. After several VM lifecycles,
-InternetSharing loses its PF device connection:
+`VZNATNetworkDeviceAttachment` manages `bridge100` and installs NAT masquerade
+rules. After several VM lifecycles the NAT state degrades: both ICMP and TCP
+from inside the VM fail (confirmed via init-script probe in daemon.log).
 
+**macOS 26+ workaround** (`com.apple.InternetSharing` was renamed/removed):
+```bash
+# Restart the NAT service (while a VM is running or just stopped):
+sudo launchctl kickstart -k system/com.apple.NetworkSharing
+# Then stop and restart the VM.
 ```
-InternetSharing: [com.apple.pf:framework] connection error: Connection invalid
-```
 
-When this happens, ICMP (ping) still routes but all TCP connections from inside
-the VM fail, causing `pelagos image pull` to fail with "error sending request".
-
-**Workaround:**
+**macOS 13–15 workaround** (PF/InternetSharing era):
 ```bash
 sudo pfctl -f /etc/pf.conf
 ```
 
-This reloads PF from scratch and lets InternetSharing re-establish cleanly.
-Symptoms: image pulls all fail with "error sending request for url (https://...)".
-`launchctl stop/start com.apple.InternetSharing` does NOT fix it.
+If neither works, a **reboot** is the reliable fix — the NAT state has fully
+rotted and cannot be reset without restarting the kernel networking stack.
+
+Symptoms: image pulls fail with "error sending request for url (https://...)";
+init probe in daemon.log shows `ICMP 8.8.8.8: FAILED` and `TCP 1.1.1.1:443: FAILED`.
+
+**Diagnosis:** Set `RUST_LOG=info` and check `~/.local/share/pelagos/daemon.log`
+after boot — the init script now probes both ICMP and TCP and logs the result.
 
 **Long-term fix:** persistent VM (Phase 2 Task D) sidesteps this entirely by
 reusing one VM across many `pelagos run` calls instead of booting fresh each time.
