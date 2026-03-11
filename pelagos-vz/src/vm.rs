@@ -249,9 +249,22 @@ impl Vm {
             }
         });
 
+        // Wait up to 5 s for the completion handler to fire.
+        // AVF does not call the handler until the guest accepts the connection,
+        // so without a timeout this would block indefinitely when the guest
+        // daemon is not yet listening.
         let mut g = result.lock().unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + timeout;
         while g.is_none() {
-            g = cvar.wait(g).unwrap();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(crate::Error::Runtime(
+                    "vsock connect timed out (guest not listening yet)".into(),
+                ));
+            }
+            let (guard, _) = cvar.wait_timeout(g, remaining).unwrap();
+            g = guard;
         }
         let raw_fd = g.take().unwrap().map_err(crate::Error::Runtime)?;
         Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw_fd) })
