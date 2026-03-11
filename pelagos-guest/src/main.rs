@@ -83,6 +83,12 @@ pub enum GuestCommand {
         env: std::collections::HashMap<String, String>,
         #[serde(default)]
         mounts: Vec<GuestMount>,
+        /// Optional container name passed to `pelagos run --name`.
+        #[serde(default)]
+        name: Option<String>,
+        /// Run detached; maps to `pelagos run --detach`.
+        #[serde(default)]
+        detach: bool,
     },
     Exec {
         image: String,
@@ -91,6 +97,27 @@ pub enum GuestCommand {
         env: std::collections::HashMap<String, String>,
         #[serde(default)]
         tty: bool,
+    },
+    /// List containers; maps to `pelagos ps [--all]`.
+    Ps {
+        #[serde(default)]
+        all: bool,
+    },
+    /// Print container logs; maps to `pelagos logs [--follow] <name>`.
+    Logs {
+        name: String,
+        #[serde(default)]
+        follow: bool,
+    },
+    /// Stop a running container; maps to `pelagos stop <name>`.
+    Stop {
+        name: String,
+    },
+    /// Remove a container; maps to `pelagos rm [--force] <name>`.
+    Rm {
+        name: String,
+        #[serde(default)]
+        force: bool,
     },
     Ping,
 }
@@ -183,8 +210,18 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 args,
                 env,
                 mounts,
+                name,
+                detach,
             } => {
-                run_container(&mut writer, &image, &args, &env, &mounts)?;
+                run_container(
+                    &mut writer,
+                    &image,
+                    &args,
+                    &env,
+                    &mounts,
+                    name.as_deref(),
+                    detach,
+                )?;
             }
             GuestCommand::Exec {
                 image,
@@ -195,9 +232,46 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 handle_exec(fd, &image, &args, &env, tty)?;
                 return Ok(());
             }
+            GuestCommand::Ps { all } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("ps");
+                if all {
+                    cmd.arg("--all");
+                }
+                spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::Logs { name, follow } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("logs").arg(&name);
+                if follow {
+                    cmd.arg("--follow");
+                }
+                spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::Stop { name } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("stop").arg(&name);
+                spawn_and_stream(&mut writer, cmd)?;
+            }
+            GuestCommand::Rm { name, force } => {
+                let mut cmd = Command::new(pelagos_bin());
+                cmd.arg("rm").arg(&name);
+                if force {
+                    cmd.arg("--force");
+                }
+                spawn_and_stream(&mut writer, cmd)?;
+            }
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// pelagos binary path
+// ---------------------------------------------------------------------------
+
+fn pelagos_bin() -> String {
+    std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +281,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
 /// Pull the image, streaming stderr lines back via the provided writer.
 /// Returns Ok(true) on success, Ok(false) on failure (error response sent).
 fn pull_image(writer: &mut impl Write, image: &str) -> std::io::Result<bool> {
-    let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
+    let pelagos = pelagos_bin();
 
     const PULL_ATTEMPTS: u32 = 10;
     let mut pull_error = String::new();
@@ -274,8 +348,10 @@ fn run_container(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     mounts: &[GuestMount],
+    name: Option<&str>,
+    detach: bool,
 ) -> std::io::Result<()> {
-    let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
+    let pelagos = pelagos_bin();
 
     if !pull_image(writer, image)? {
         return Ok(());
@@ -295,6 +371,12 @@ fn run_container(
 
     let mut cmd = Command::new(&pelagos);
     cmd.arg("run");
+    if let Some(n) = name {
+        cmd.arg("--name").arg(n);
+    }
+    if detach {
+        cmd.arg("--detach");
+    }
     // Pass each virtiofs guest-side path as a -v bind mount to pelagos run.
     for mount in mounts {
         let guest_mnt = format!("/mnt/{}", mount.tag);
@@ -308,6 +390,21 @@ fn run_container(
     for (k, v) in env {
         cmd.env(k, v);
     }
+
+    if detach {
+        run_detached(writer, cmd)
+    } else {
+        spawn_and_stream(writer, cmd)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// spawn_and_stream — generic helper for non-interactive pelagos subcommands
+// ---------------------------------------------------------------------------
+
+/// Spawn `cmd` with piped stdout/stderr, relay both streams as JSON
+/// `GuestResponse::Stream` messages, then send a final `GuestResponse::Exit`.
+fn spawn_and_stream(writer: &mut impl Write, mut cmd: Command) -> std::io::Result<()> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
@@ -323,7 +420,6 @@ fn run_container(
         }
     };
 
-    // Stream stdout and stderr concurrently using threads.
     let stdout_pipe = child.stdout.take().unwrap();
     let stderr_pipe = child.stderr.take().unwrap();
 
@@ -364,7 +460,6 @@ fn run_container(
         let _ = tx_err.send(Chunk::Done);
     });
 
-    // Relay chunks to the vsock writer until both streams signal Done.
     let mut done_count = 0;
     while done_count < 2 {
         match rx.recv() {
@@ -398,6 +493,65 @@ fn run_container(
 }
 
 // ---------------------------------------------------------------------------
+// run_detached — reads container name then drops stdout pipe immediately
+// ---------------------------------------------------------------------------
+
+/// Run pelagos with `--detach`, read the one-line container name from stdout,
+/// then drop the pipe so the watcher child (which holds the write end) does not
+/// block this function.  Sends `GuestResponse::Stream` with the name followed
+/// by `GuestResponse::Exit`.
+fn run_detached(writer: &mut impl Write, mut cmd: Command) -> std::io::Result<()> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: e.to_string(),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Read exactly one line (the container name) and immediately drop the pipe.
+    // The watcher child keeps the write end open for the container's lifetime;
+    // dropping our read end here prevents blocking on the watcher.
+    let name_line = {
+        let stdout_pipe = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout_pipe);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let trimmed = line
+            .trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .to_string();
+        trimmed
+        // stdout_pipe (via reader) is dropped here — write end stays open in watcher
+    };
+
+    // The pelagos parent exits after printing the name; wait for it (fast).
+    let status = child.wait()?;
+    let code = status.code().unwrap_or(-1);
+
+    if !name_line.is_empty() {
+        send_response(
+            writer,
+            &GuestResponse::Stream {
+                stream: StreamKind::Stdout,
+                data: name_line + "\n",
+            },
+        )?;
+    }
+    send_response(writer, &GuestResponse::Exit { exit: code })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Exec handler
 // ---------------------------------------------------------------------------
 
@@ -408,7 +562,7 @@ fn handle_exec(
     env: &std::collections::HashMap<String, String>,
     tty: bool,
 ) -> std::io::Result<()> {
-    let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
+    let pelagos = pelagos_bin();
 
     // Pull the image before sending ready; relay stderr as JSON stream so the
     // host can display pull progress while waiting.
@@ -842,11 +996,29 @@ mod tests {
                 image,
                 args,
                 mounts,
+                name,
+                detach,
                 ..
             } => {
                 assert_eq!(image, "alpine");
                 assert_eq!(args, vec!["/bin/echo", "hello"]);
                 assert!(mounts.is_empty());
+                assert!(name.is_none());
+                assert!(!detach);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_with_name_and_detach_deserializes() {
+        let json =
+            r#"{"cmd":"run","image":"alpine","args":["sleep","30"],"name":"mybox","detach":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Run { name, detach, .. } => {
+                assert_eq!(name.as_deref(), Some("mybox"));
+                assert!(detach);
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -894,6 +1066,47 @@ mod tests {
             }
             other => panic!("unexpected: {:?}", other),
         }
+    }
+
+    #[test]
+    fn ps_deserializes() {
+        let json = r#"{"cmd":"ps","all":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::Ps { all: true }));
+    }
+
+    #[test]
+    fn ps_defaults_all_false() {
+        let json = r#"{"cmd":"ps"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::Ps { all: false }));
+    }
+
+    #[test]
+    fn logs_deserializes() {
+        let json = r#"{"cmd":"logs","name":"mybox","follow":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Logs { name, follow } => {
+                assert_eq!(name, "mybox");
+                assert!(follow);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stop_deserializes() {
+        let json = r#"{"cmd":"stop","name":"mybox"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::Stop { name } if name == "mybox"));
+    }
+
+    #[test]
+    fn rm_deserializes() {
+        let json = r#"{"cmd":"rm","name":"mybox","force":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        assert!(matches!(cmd, GuestCommand::Rm { name, force: true } if name == "mybox"));
     }
 
     #[test]

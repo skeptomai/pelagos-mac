@@ -65,6 +65,12 @@ enum Commands {
         /// Arguments to pass to the container (use -- before flags, e.g. -- -c "cmd")
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+        /// Assign a name to the container
+        #[arg(long)]
+        name: Option<String>,
+        /// Run in background; print container name and exit
+        #[arg(short = 'd', long)]
+        detach: bool,
     },
     /// Run a command interactively in a container (stdin forwarded, optional TTY)
     Exec {
@@ -76,6 +82,33 @@ enum Commands {
         /// Allocate a pseudo-TTY (default: auto-detect from stdin)
         #[arg(short = 't', long)]
         tty: bool,
+    },
+    /// List containers (running by default; use -a for all)
+    Ps {
+        /// Show all containers, including exited
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
+    /// Print container logs
+    Logs {
+        /// Container name
+        name: String,
+        /// Follow log output
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// Stop a running container
+    Stop {
+        /// Container name
+        name: String,
+    },
+    /// Remove a container
+    Rm {
+        /// Container name
+        name: String,
+        /// Force remove even if running
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     /// Ping the guest daemon (readiness check)
     Ping,
@@ -110,6 +143,10 @@ pub struct GuestMount {
     pub container_path: String,
 }
 
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 #[derive(Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum GuestCommand {
@@ -118,6 +155,10 @@ enum GuestCommand {
         args: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mounts: Vec<GuestMount>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(skip_serializing_if = "is_false")]
+        detach: bool,
     },
     Exec {
         image: String,
@@ -125,6 +166,23 @@ enum GuestCommand {
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
         tty: bool,
+    },
+    Ps {
+        #[serde(skip_serializing_if = "is_false")]
+        all: bool,
+    },
+    Logs {
+        name: String,
+        #[serde(skip_serializing_if = "is_false")]
+        follow: bool,
+    },
+    Stop {
+        name: String,
+    },
+    Rm {
+        name: String,
+        #[serde(skip_serializing_if = "is_false")]
+        force: bool,
     },
     Ping,
 }
@@ -191,9 +249,12 @@ fn main() {
         Commands::Run {
             ref image,
             ref args,
+            ref name,
+            detach,
         } => {
             let image = image.clone();
             let args = args.clone();
+            let name = name.clone();
             let daemon_args = daemon_args_from_cli(&cli);
             // Build the guest-side mount list from the parsed shares.
             let mounts: Vec<GuestMount> = daemon_args
@@ -209,7 +270,16 @@ fn main() {
                 process::exit(1);
             }
             let stream = connect_or_exit();
-            process::exit(run_command(stream, image, args, mounts));
+            process::exit(passthrough_command(
+                stream,
+                GuestCommand::Run {
+                    image,
+                    args,
+                    mounts,
+                    name,
+                    detach,
+                },
+            ));
         }
 
         Commands::Exec {
@@ -237,6 +307,55 @@ fn main() {
             }
             let stream = connect_or_exit();
             process::exit(ping_command(stream));
+        }
+
+        Commands::Ps { all } => {
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(passthrough_command(stream, GuestCommand::Ps { all }));
+        }
+
+        Commands::Logs { ref name, follow } => {
+            let name = name.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(passthrough_command(
+                stream,
+                GuestCommand::Logs { name, follow },
+            ));
+        }
+
+        Commands::Stop { ref name } => {
+            let name = name.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(passthrough_command(stream, GuestCommand::Stop { name }));
+        }
+
+        Commands::Rm { ref name, force } => {
+            let name = name.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(passthrough_command(
+                stream,
+                GuestCommand::Rm { name, force },
+            ));
         }
     }
 }
@@ -351,20 +470,12 @@ fn vm_status() {
 // Command handlers — operate on a UnixStream connected to the daemon
 // ---------------------------------------------------------------------------
 
-fn run_command(
-    stream: UnixStream,
-    image: String,
-    args: Vec<String>,
-    mounts: Vec<GuestMount>,
-) -> i32 {
+/// Send `cmd` to the guest and relay streaming output to stdout/stderr.
+/// Returns the container exit code (or 1 on protocol error).
+fn passthrough_command(stream: UnixStream, cmd: GuestCommand) -> i32 {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut writer = stream;
 
-    let cmd = GuestCommand::Run {
-        image,
-        args,
-        mounts,
-    };
     let mut msg = serde_json::to_string(&cmd).unwrap();
     msg.push('\n');
     if let Err(e) = writer.write_all(msg.as_bytes()) {
@@ -742,12 +853,33 @@ mod tests {
             image: "alpine".into(),
             args: vec!["/bin/echo".into(), "hello".into()],
             mounts: vec![],
+            name: None,
+            detach: false,
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["cmd"], "run");
         assert_eq!(v["image"], "alpine");
         assert_eq!(v["args"][0], "/bin/echo");
+        // name and detach omitted when None/false
+        assert!(v.get("name").is_none() || v["name"].is_null());
+        assert!(v.get("detach").is_none() || v["detach"] == false);
+    }
+
+    #[test]
+    fn run_command_with_name_detach_serializes() {
+        let cmd = GuestCommand::Run {
+            image: "alpine".into(),
+            args: vec!["sleep".into(), "30".into()],
+            mounts: vec![],
+            name: Some("mybox".into()),
+            detach: true,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "run");
+        assert_eq!(v["name"], "mybox");
+        assert_eq!(v["detach"], true);
     }
 
     #[test]
@@ -759,12 +891,61 @@ mod tests {
                 tag: "share0".into(),
                 container_path: "/data".into(),
             }],
+            name: None,
+            detach: false,
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["cmd"], "run");
         assert_eq!(v["mounts"][0]["tag"], "share0");
         assert_eq!(v["mounts"][0]["container_path"], "/data");
+    }
+
+    #[test]
+    fn ps_command_serializes() {
+        let cmd = GuestCommand::Ps { all: true };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "ps");
+        assert_eq!(v["all"], true);
+    }
+
+    #[test]
+    fn logs_command_serializes() {
+        let cmd = GuestCommand::Logs {
+            name: "mybox".into(),
+            follow: false,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "logs");
+        assert_eq!(v["name"], "mybox");
+        // follow omitted when false
+        assert!(v.get("follow").is_none() || v["follow"] == false);
+    }
+
+    #[test]
+    fn stop_command_serializes() {
+        let cmd = GuestCommand::Stop {
+            name: "mybox".into(),
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "stop");
+        assert_eq!(v["name"], "mybox");
+    }
+
+    #[test]
+    fn rm_command_serializes() {
+        let cmd = GuestCommand::Rm {
+            name: "mybox".into(),
+            force: true,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "rm");
+        assert_eq!(v["name"], "mybox");
+        assert_eq!(v["force"], true);
     }
 
     #[test]
