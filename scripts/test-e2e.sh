@@ -251,6 +251,85 @@ fi
 pelagos vm stop > /dev/null 2>&1 || true
 sleep 1
 
+# ---------------------------------------------------------------------------
+# Tests 8-13: container lifecycle (ps, logs, stop, rm, --name, --detach)
+#
+# Requires the daemon to be running without mounts; restarts clean after
+# test 7 stopped it.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 8: run --detach --name ==="
+# Start daemon (no mounts) before detach tests.
+pelagos ping > /dev/null 2>&1 || true
+sleep 1
+LC_NAME="pelagos-lc-test-$$"
+OUT=$(pelagos run --detach --name "$LC_NAME" alpine /bin/sh -c "echo lc-output; sleep 15")
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -q "$LC_NAME"; then
+    pass "run --detach: printed container name '${LC_NAME}'"
+else
+    fail "run --detach: expected container name '${LC_NAME}', got: $(echo "$OUT" | grep -v '^\[')"
+fi
+
+echo ""
+echo "=== test 9: ps shows running container ==="
+# Give the detached container a moment to register.
+sleep 1
+OUT=$(pelagos ps)
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -q "$LC_NAME"; then
+    pass "ps: running container '${LC_NAME}' visible"
+else
+    fail "ps: expected '${LC_NAME}', got: $(echo "$OUT" | grep -v '^\[')"
+fi
+
+echo ""
+echo "=== test 10: logs show container output ==="
+OUT=$(pelagos logs "$LC_NAME")
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -q "lc-output"; then
+    pass "logs: 'lc-output' present in logs"
+else
+    fail "logs: expected 'lc-output', got: $(echo "$OUT" | grep -v '^\[')"
+fi
+
+echo ""
+echo "=== test 11: stop container ==="
+pelagos stop "$LC_NAME"; STOP_EXIT=$?
+# pelagos stop returns 0 on success (output may vary)
+if [ "$STOP_EXIT" -eq 0 ]; then
+    pass "stop: exited 0"
+else
+    fail "stop: non-zero exit (got $STOP_EXIT)"
+fi
+
+echo ""
+echo "=== test 12: ps --all shows exited container ==="
+sleep 1
+OUT=$(pelagos ps --all)
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -q "$LC_NAME"; then
+    pass "ps --all: stopped container '${LC_NAME}' still visible"
+else
+    fail "ps --all: expected '${LC_NAME}', got: $(echo "$OUT" | grep -v '^\[')"
+fi
+
+echo ""
+echo "=== test 13: rm removes container ==="
+pelagos rm "$LC_NAME" > /dev/null 2>&1
+OUT=$(pelagos ps --all)
+echo "$OUT" | grep -v "^\["
+if echo "$OUT" | grep -q "$LC_NAME"; then
+    fail "rm: '${LC_NAME}' still appears after rm"
+else
+    pass "rm: '${LC_NAME}' no longer in ps --all"
+fi
+
+# Stop daemon so lifecycle tests get a clean slate.
+pelagos vm stop > /dev/null 2>&1 || true
+sleep 1
+
 fi  # end of functional tests
 
 # ---------------------------------------------------------------------------
@@ -259,7 +338,7 @@ fi  # end of functional tests
 
 if [ "$MODE" = "cold" ] || [ "$MODE" = "warm" ]; then
 
-# In cold mode, test 6 stopped the daemon.  Restart it (no mounts) so the
+# In cold mode, test 13 stopped the daemon.  Restart it (no mounts) so the
 # lifecycle tests have a running daemon to inspect and stop.
 if [ "$MODE" = "cold" ]; then
     echo ""
@@ -269,11 +348,11 @@ if [ "$MODE" = "cold" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Test 7: vm status reports running
+# Test 14: vm status reports running
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 7: vm status ==="
+echo "=== test 14: vm status ==="
 OUT=$(pelagos vm status 2>&1 || true)
 echo "  $OUT"
 if echo "$OUT" | grep -q "running"; then
@@ -283,11 +362,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 8: warm ping is fast (daemon already running)
+# Test 15: warm ping is fast (daemon already running)
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 8: warm ping latency ==="
+echo "=== test 15: warm ping latency ==="
 T0=$(ms_now); OUT=$(pelagos ping); T1=$(ms_now)
 WARM_MS=$(( T1 - T0 ))
 echo "$OUT" | grep -v "^\["
@@ -308,11 +387,11 @@ if [ "$MODE" = "cold" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Test 9: vm stop + verify stopped
+# Test 16: vm stop + verify stopped
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 9: vm stop ==="
+echo "=== test 16: vm stop ==="
 pelagos vm stop > /dev/null 2>&1
 sleep 2
 OUT=$(pelagos vm status 2>&1 || true)
