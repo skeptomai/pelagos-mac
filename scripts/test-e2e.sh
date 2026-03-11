@@ -191,6 +191,32 @@ else
     fail "$BACK_FAIL of 3 back-to-back runs failed"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 6: virtiofs bind mount
+#
+# Mounts are fixed at daemon startup.  Stop the currently-running daemon
+# (started without -v by tests 1-5), boot a fresh one with -v, run the
+# mount test, then stop it so the lifecycle tests (7-9) can restart fresh.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 6: virtiofs bind mount ==="
+# Stop the no-mount daemon started by tests 1-5.
+pelagos vm stop > /dev/null 2>&1 || true
+sleep 1
+TMPHOST=$(mktemp -d)
+echo "hello from host" > "$TMPHOST/hello.txt"
+OUT=$(pelagos -v "$TMPHOST:/data" run alpine cat /data/hello.txt)
+rm -rf "$TMPHOST"
+if echo "$OUT" | grep -q "hello from host"; then
+    pass "virtiofs mount: file visible inside container"
+else
+    fail "virtiofs mount failed; output: $(echo "$OUT" | grep -v '^\[')"
+fi
+# Stop the mount-enabled daemon so lifecycle tests get a clean slate.
+pelagos vm stop > /dev/null 2>&1 || true
+sleep 1
+
 fi  # end of functional tests
 
 # ---------------------------------------------------------------------------
@@ -199,12 +225,21 @@ fi  # end of functional tests
 
 if [ "$MODE" = "cold" ] || [ "$MODE" = "warm" ]; then
 
+# In cold mode, test 6 stopped the daemon.  Restart it (no mounts) so the
+# lifecycle tests have a running daemon to inspect and stop.
+if [ "$MODE" = "cold" ]; then
+    echo ""
+    echo "=== restarting daemon (no mounts) for lifecycle tests ==="
+    pelagos ping > /dev/null 2>&1 || true  # triggers daemon start
+    sleep 1
+fi
+
 # ---------------------------------------------------------------------------
-# Test 6: vm status reports running
+# Test 7: vm status reports running
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 6: vm status ==="
+echo "=== test 7: vm status ==="
 OUT=$(pelagos vm status 2>&1 || true)
 echo "  $OUT"
 if echo "$OUT" | grep -q "running"; then
@@ -214,11 +249,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 7: warm ping is fast (daemon already running)
+# Test 8: warm ping is fast (daemon already running)
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 7: warm ping latency ==="
+echo "=== test 8: warm ping latency ==="
 T0=$(ms_now); OUT=$(pelagos ping); T1=$(ms_now)
 WARM_MS=$(( T1 - T0 ))
 echo "$OUT" | grep -v "^\["
@@ -239,11 +274,11 @@ if [ "$MODE" = "cold" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Test 8: vm stop + verify stopped
+# Test 9: vm stop + verify stopped
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== test 8: vm stop ==="
+echo "=== test 9: vm stop ==="
 pelagos vm stop > /dev/null 2>&1
 sleep 2
 OUT=$(pelagos vm status 2>&1 || true)

@@ -1,4 +1,5 @@
-//! Persistent VM state: PID file and Unix socket path in ~/.local/share/pelagos/.
+//! Persistent VM state: PID file, Unix socket path, and mounts config
+//! stored in ~/.local/share/pelagos/.
 
 use std::io;
 use std::path::PathBuf;
@@ -6,6 +7,7 @@ use std::path::PathBuf;
 pub struct StateDir {
     pub pid_file: PathBuf,
     pub sock_file: PathBuf,
+    pub mounts_file: PathBuf,
 }
 
 impl StateDir {
@@ -15,6 +17,7 @@ impl StateDir {
         Ok(Self {
             pid_file: base.join("vm.pid"),
             sock_file: base.join("vm.sock"),
+            mounts_file: base.join("vm.mounts"),
         })
     }
 
@@ -39,10 +42,31 @@ impl StateDir {
         std::fs::rename(&tmp, &self.pid_file)
     }
 
-    /// Remove PID and socket files. Best-effort; ignores errors.
+    /// Write the current daemon's mount configuration as JSON.
+    pub fn write_mounts(&self, mounts: &[crate::daemon::VirtiofsShare]) -> io::Result<()> {
+        let json = serde_json::to_string(mounts)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = self.mounts_file.with_extension("mounts.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &self.mounts_file)
+    }
+
+    /// Read the running daemon's mount configuration.  Returns an empty Vec
+    /// if the file does not exist.
+    pub fn read_mounts(&self) -> io::Result<Vec<crate::daemon::VirtiofsShare>> {
+        match std::fs::read_to_string(&self.mounts_file) {
+            Ok(s) => serde_json::from_str(&s)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Remove PID, socket, and mounts files. Best-effort; ignores errors.
     pub fn clear(&self) {
         let _ = std::fs::remove_file(&self.pid_file);
         let _ = std::fs::remove_file(&self.sock_file);
+        let _ = std::fs::remove_file(&self.mounts_file);
     }
 }
 
