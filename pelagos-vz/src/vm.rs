@@ -181,7 +181,9 @@ impl Vm {
     /// Retries up to 30 times with a 1-second delay between attempts to allow
     /// the guest daemon time to start after the VM boots.
     pub fn connect_vsock(&self) -> Result<std::os::unix::io::OwnedFd, crate::Error> {
-        const MAX_ATTEMPTS: u32 = 30;
+        // Ping gate worst-case: 15 iterations × -W 3s = 45s.  Give the guest
+        // 60 attempts (60s) so the host never times out before pelagos-guest starts.
+        const MAX_ATTEMPTS: u32 = 60;
         let mut last_err = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
             match self.try_connect_vsock() {
@@ -355,10 +357,13 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
 
     // 4. Virtio block storage.
     let disk_url = file_url(&config.disk);
+    // Open read-only: the placeholder disk is never written to from init.
+    // Read-only avoids an exclusive lock that would prevent concurrent or
+    // rapid back-to-back VMs from attaching the same image file.
     let disk_attach = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
         VZDiskImageStorageDeviceAttachment::alloc(),
         &disk_url,
-        false,
+        true,
     )
     .map_err(|e| crate::Error::Config(e.localizedDescription().to_string()))?;
     let block_dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
