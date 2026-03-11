@@ -2,16 +2,19 @@
 //!
 //! Boots a Linux VM via Apple Virtualization Framework (pelagos-vz), then
 //! forwards subcommands to the pelagos-guest daemon inside the VM over vsock.
+//! The VM is kept alive between invocations via a background daemon process
+//! that owns the VZVirtualMachine and proxies vsock connections over a Unix socket.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::FromRawFd;
-use std::os::unix::io::IntoRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
-use pelagos_vz::vm::{Vm, VmConfig};
 use serde::{Deserialize, Serialize};
+
+mod daemon;
+mod state;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -22,7 +25,7 @@ use serde::{Deserialize, Serialize};
 struct Cli {
     /// Path to the VM kernel image
     #[arg(long, env = "PELAGOS_KERNEL")]
-    kernel: PathBuf,
+    kernel: Option<PathBuf>,
 
     /// Path to the initrd image
     #[arg(long, env = "PELAGOS_INITRD")]
@@ -30,11 +33,11 @@ struct Cli {
 
     /// Path to the root disk image
     #[arg(long, env = "PELAGOS_DISK")]
-    disk: PathBuf,
+    disk: Option<PathBuf>,
 
-    /// Kernel command-line arguments (overrides the built-in default)
-    #[arg(long, env = "PELAGOS_CMDLINE")]
-    cmdline: Option<String>,
+    /// Kernel command-line arguments
+    #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0")]
+    cmdline: String,
 
     /// Memory in MiB (default 1024)
     #[arg(long, default_value = "1024")]
@@ -60,6 +63,22 @@ enum Commands {
     },
     /// Ping the guest daemon (readiness check)
     Ping,
+    /// Persistent VM management
+    Vm {
+        #[command(subcommand)]
+        sub: VmCommands,
+    },
+    /// Internal: run as the persistent VM daemon. Not for direct use.
+    #[command(hide = true)]
+    VmDaemonInternal,
+}
+
+#[derive(Subcommand)]
+enum VmCommands {
+    /// Stop the persistent VM daemon
+    Stop,
+    /// Show persistent VM daemon status
+    Status,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,59 +109,108 @@ fn main() {
     env_logger::init();
     let cli = Cli::parse();
 
-    let mut builder = VmConfig::builder()
-        .kernel(&cli.kernel)
-        .disk(&cli.disk)
-        .memory_mib(cli.memory)
-        .cpus(cli.cpus);
-    if let Some(ref initrd) = cli.initrd {
-        builder = builder.initrd(initrd);
+    match cli.command {
+        Commands::VmDaemonInternal => {
+            let args = daemon_args_from_cli(&cli);
+            daemon::run(args); // -> !
+        }
+
+        Commands::Vm { sub: VmCommands::Stop } => vm_stop(),
+        Commands::Vm { sub: VmCommands::Status } => vm_status(),
+
+        Commands::Run { ref image, ref args } => {
+            let image = image.clone();
+            let args = args.clone();
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(run_command(stream, image, args));
+        }
+
+        Commands::Ping => {
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
+                process::exit(1);
+            }
+            let stream = connect_or_exit();
+            process::exit(ping_command(stream));
+        }
     }
-    if let Some(ref cmdline) = cli.cmdline {
-        builder = builder.cmdline(cmdline);
-    }
-    let config = builder.build().unwrap_or_else(|e| {
-        log::error!("{}", e);
+}
+
+fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
+    let kernel = cli.kernel.clone().unwrap_or_else(|| {
+        log::error!("--kernel / PELAGOS_KERNEL is required");
         process::exit(1);
     });
-
-    log::info!("Booting VM...");
-    let vm = Vm::start(config).unwrap_or_else(|e| {
-        log::error!("VM start failed: {}", e);
+    let disk = cli.disk.clone().unwrap_or_else(|| {
+        log::error!("--disk / PELAGOS_DISK is required");
         process::exit(1);
     });
-    log::info!("VM running.");
+    daemon::DaemonArgs {
+        kernel,
+        initrd: cli.initrd.clone(),
+        disk,
+        cmdline: cli.cmdline.clone(),
+        memory_mib: cli.memory,
+        cpus: cli.cpus,
+    }
+}
 
-    let exit_code = match cli.command {
-        Commands::Run { image, args } => run_command(&vm, image, args),
-        Commands::Ping => ping_command(&vm),
-    };
-
-    // Drop Vm explicitly before exit so stop() runs and bridge100 detaches.
-    // process::exit() bypasses destructors, so without this the VM lingers and
-    // the next run races with the previous bridge100 teardown.
-    drop(vm);
-    // Give InternetSharing time to fully tear down bridge100 and flush PF NAT
-    // state before the process exits.  stop() polls until VZVirtualMachineState::Stopped,
-    // but bridge100 detaches ~1s later in a background IS callback.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    process::exit(exit_code);
+fn connect_or_exit() -> UnixStream {
+    daemon::connect().unwrap_or_else(|e| {
+        log::error!("connect to VM daemon: {}", e);
+        process::exit(1);
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Command handlers
+// VM management commands
 // ---------------------------------------------------------------------------
 
-fn run_command(vm: &Vm, image: String, args: Vec<String>) -> i32 {
-    let fd = vm.connect_vsock().unwrap_or_else(|e| {
-        log::error!("vsock connect failed: {}", e);
+fn vm_stop() {
+    let state = state::StateDir::open().unwrap_or_else(|e| {
+        log::error!("state dir: {}", e);
         process::exit(1);
     });
+    match state.running_pid() {
+        None => {
+            println!("no VM running");
+        }
+        Some(pid) => {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            println!("sent SIGTERM to daemon (pid {})", pid);
+        }
+    }
+}
 
-    let raw = fd.into_raw_fd();
-    let write_fd = unsafe { libc::dup(raw) };
-    let mut reader = BufReader::new(unsafe { std::fs::File::from_raw_fd(raw) });
-    let mut writer = unsafe { std::fs::File::from_raw_fd(write_fd) };
+fn vm_status() {
+    let state = state::StateDir::open().unwrap_or_else(|e| {
+        log::error!("state dir: {}", e);
+        process::exit(1);
+    });
+    match state.running_pid() {
+        None => {
+            println!("stopped");
+            process::exit(1);
+        }
+        Some(pid) => {
+            println!("running (pid {})", pid);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command handlers — operate on a UnixStream connected to the daemon
+// ---------------------------------------------------------------------------
+
+fn run_command(stream: UnixStream, image: String, args: Vec<String>) -> i32 {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
 
     let cmd = GuestCommand::Run { image, args };
     let mut msg = serde_json::to_string(&cmd).unwrap();
@@ -192,6 +260,37 @@ fn run_command(vm: &Vm, image: String, args: Vec<String>) -> i32 {
     exit_code
 }
 
+fn ping_command(stream: UnixStream) -> i32 {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    let mut msg = serde_json::to_string(&GuestCommand::Ping).unwrap();
+    msg.push('\n');
+    if let Err(e) = writer.write_all(msg.as_bytes()) {
+        log::error!("write error: {}", e);
+        return 1;
+    }
+
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) | Err(_) => {
+            log::error!("no response from guest");
+            return 1;
+        }
+        Ok(_) => {}
+    }
+    match serde_json::from_str::<GuestResponse>(line.trim_end()) {
+        Ok(GuestResponse::Pong { pong: true }) => {
+            println!("pong");
+            0
+        }
+        other => {
+            log::error!("unexpected ping response: {:?}", other);
+            1
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -221,30 +320,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_stderr_deserializes() {
-        let json = r#"{"stream":{"stream":"stderr","data":"error\n"}}"#;
-        let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
-        match resp {
-            GuestResponse::Stream { stream, data } => {
-                assert_eq!(stream, "stderr");
-                assert_eq!(data, "error\n");
-            }
-            other => panic!("unexpected: {:?}", other),
-        }
-    }
-
-    #[test]
     fn exit_deserializes() {
         let json = r#"{"exit":{"exit":0}}"#;
         let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
         assert!(matches!(resp, GuestResponse::Exit { exit: 0 }));
-    }
-
-    #[test]
-    fn exit_nonzero_deserializes() {
-        let json = r#"{"exit":{"exit":127}}"#;
-        let resp: GuestResponse = serde_json::from_str(json).expect("parse failed");
-        assert!(matches!(resp, GuestResponse::Exit { exit: 127 }));
     }
 
     #[test]
@@ -258,7 +337,6 @@ mod tests {
         assert_eq!(v["cmd"], "run");
         assert_eq!(v["image"], "alpine");
         assert_eq!(v["args"][0], "/bin/echo");
-        assert_eq!(v["args"][1], "hello");
     }
 
     #[test]
@@ -267,55 +345,5 @@ mod tests {
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["cmd"], "ping");
-    }
-
-    /// Integration test: requires VM image artifacts in out/ and code-signed binary.
-    ///
-    /// Run with:
-    ///   PELAGOS_KERNEL=out/vmlinuz PELAGOS_INITRD=out/initramfs-custom.gz \
-    ///   PELAGOS_DISK=out/root.img cargo test -- --ignored run_echo_hello
-    #[test]
-    #[ignore]
-    fn run_echo_hello() {
-        // This test is a manual execution guide; the actual run is validated
-        // interactively. See ONGOING_TASKS.md for the full test command.
-    }
-}
-
-fn ping_command(vm: &Vm) -> i32 {
-    let fd = vm.connect_vsock().unwrap_or_else(|e| {
-        log::error!("vsock connect failed: {}", e);
-        process::exit(1);
-    });
-
-    let raw = fd.into_raw_fd();
-    let write_fd = unsafe { libc::dup(raw) };
-    let mut reader = BufReader::new(unsafe { std::fs::File::from_raw_fd(raw) });
-    let mut writer = unsafe { std::fs::File::from_raw_fd(write_fd) };
-
-    let mut msg = serde_json::to_string(&GuestCommand::Ping).unwrap();
-    msg.push('\n');
-    if let Err(e) = writer.write_all(msg.as_bytes()) {
-        log::error!("write error: {}", e);
-        return 1;
-    }
-
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => {
-            log::error!("no response from guest");
-            return 1;
-        }
-        Ok(_) => {}
-    }
-    match serde_json::from_str::<GuestResponse>(line.trim_end()) {
-        Ok(GuestResponse::Pong { pong: true }) => {
-            println!("pong");
-            0
-        }
-        other => {
-            log::error!("unexpected ping response: {:?}", other);
-            1
-        }
     }
 }

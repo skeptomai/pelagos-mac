@@ -70,9 +70,11 @@ fn main() {
             }
         };
         log::debug!("accepted connection");
-        if let Err(e) = handle_connection(conn_fd) {
-            log::error!("connection handler error: {}", e);
-        }
+        std::thread::spawn(move || {
+            if let Err(e) = handle_connection(conn_fd) {
+                log::error!("connection handler error: {}", e);
+            }
+        });
     }
 }
 
