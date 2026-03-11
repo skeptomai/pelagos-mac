@@ -106,7 +106,8 @@ impl VmConfigBuilder {
         tag: impl Into<String>,
         read_only: bool,
     ) -> Self {
-        self.virtiofs_shares.push((host.into(), tag.into(), read_only));
+        self.virtiofs_shares
+            .push((host.into(), tag.into(), read_only));
         self
     }
     pub fn rosetta(mut self, enabled: bool) -> Self {
