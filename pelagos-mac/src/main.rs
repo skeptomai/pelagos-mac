@@ -47,6 +47,11 @@ struct Cli {
     #[arg(long, default_value = "2")]
     cpus: usize,
 
+    /// Bind-mount a host directory into the container: /host/path:/container/path[:ro]
+    /// May be specified multiple times.
+    #[arg(short = 'v', long = "volume", global = true)]
+    volumes: Vec<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -85,10 +90,24 @@ enum VmCommands {
 // Guest protocol types (mirrors pelagos-guest)
 // ---------------------------------------------------------------------------
 
+/// A mount to pass to the guest for bind-mounting inside the container.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GuestMount {
+    /// virtiofs tag (e.g. "share0") — already mounted at /mnt/<tag> in the guest.
+    pub tag: String,
+    /// Absolute path inside the container.
+    pub container_path: String,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum GuestCommand {
-    Run { image: String, args: Vec<String> },
+    Run {
+        image: String,
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mounts: Vec<GuestMount>,
+    },
     Ping,
 }
 
@@ -122,12 +141,21 @@ fn main() {
             let image = image.clone();
             let args = args.clone();
             let daemon_args = daemon_args_from_cli(&cli);
+            // Build the guest-side mount list from the parsed shares.
+            let mounts: Vec<GuestMount> = daemon_args
+                .virtiofs_shares
+                .iter()
+                .map(|s| GuestMount {
+                    tag: s.tag.clone(),
+                    container_path: s.container_path.clone(),
+                })
+                .collect();
             if let Err(e) = daemon::ensure_running(&daemon_args) {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
             let stream = connect_or_exit();
-            process::exit(run_command(stream, image, args));
+            process::exit(run_command(stream, image, args, mounts));
         }
 
         Commands::Ping => {
@@ -151,6 +179,9 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         log::error!("--disk / PELAGOS_DISK is required");
         process::exit(1);
     });
+
+    let virtiofs_shares = parse_volumes(&cli.volumes);
+
     daemon::DaemonArgs {
         kernel,
         initrd: cli.initrd.clone(),
@@ -158,7 +189,36 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         cmdline: cli.cmdline.clone(),
         memory_mib: cli.memory,
         cpus: cli.cpus,
+        virtiofs_shares,
     }
+}
+
+/// Parse `-v /host/path:/container/path[:ro]` strings into `VirtiofsShare`s.
+/// Tags are assigned as `share0`, `share1`, etc.
+fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
+    volumes
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let parts: Vec<&str> = spec.splitn(3, ':').collect();
+            if parts.len() < 2 {
+                log::error!(
+                    "invalid volume spec {:?}: expected /host:/container[:ro]",
+                    spec
+                );
+                process::exit(1);
+            }
+            let host_path = PathBuf::from(parts[0]);
+            let container_path = parts[1].to_string();
+            let read_only = parts.get(2).is_some_and(|s| *s == "ro");
+            daemon::VirtiofsShare {
+                host_path,
+                tag: format!("share{}", i),
+                read_only,
+                container_path,
+            }
+        })
+        .collect()
 }
 
 fn connect_or_exit() -> UnixStream {
@@ -208,11 +268,16 @@ fn vm_status() {
 // Command handlers — operate on a UnixStream connected to the daemon
 // ---------------------------------------------------------------------------
 
-fn run_command(stream: UnixStream, image: String, args: Vec<String>) -> i32 {
+fn run_command(
+    stream: UnixStream,
+    image: String,
+    args: Vec<String>,
+    mounts: Vec<GuestMount>,
+) -> i32 {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut writer = stream;
 
-    let cmd = GuestCommand::Run { image, args };
+    let cmd = GuestCommand::Run { image, args, mounts };
     let mut msg = serde_json::to_string(&cmd).unwrap();
     msg.push('\n');
     if let Err(e) = writer.write_all(msg.as_bytes()) {
@@ -297,7 +362,7 @@ fn ping_command(stream: UnixStream) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuestCommand, GuestResponse};
+    use super::{GuestCommand, GuestMount, GuestResponse};
 
     #[test]
     fn pong_deserializes() {
@@ -331,6 +396,7 @@ mod tests {
         let cmd = GuestCommand::Run {
             image: "alpine".into(),
             args: vec!["/bin/echo".into(), "hello".into()],
+            mounts: vec![],
         };
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -340,10 +406,52 @@ mod tests {
     }
 
     #[test]
+    fn run_command_with_mounts_serializes() {
+        let cmd = GuestCommand::Run {
+            image: "alpine".into(),
+            args: vec!["cat".into(), "/data/hello.txt".into()],
+            mounts: vec![GuestMount {
+                tag: "share0".into(),
+                container_path: "/data".into(),
+            }],
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize failed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cmd"], "run");
+        assert_eq!(v["mounts"][0]["tag"], "share0");
+        assert_eq!(v["mounts"][0]["container_path"], "/data");
+    }
+
+    #[test]
     fn ping_command_serializes() {
         let cmd = GuestCommand::Ping;
         let json = serde_json::to_string(&cmd).expect("serialize failed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["cmd"], "ping");
+    }
+
+    #[test]
+    fn parse_volumes_basic() {
+        use super::parse_volumes;
+        let specs = vec!["/host/foo:/container/bar".to_string()];
+        let shares = parse_volumes(&specs);
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].tag, "share0");
+        assert_eq!(shares[0].container_path, "/container/bar");
+        assert!(!shares[0].read_only);
+    }
+
+    #[test]
+    fn parse_volumes_readonly() {
+        use super::parse_volumes;
+        let specs = vec![
+            "/host/a:/ctr/a:ro".to_string(),
+            "/host/b:/ctr/b".to_string(),
+        ];
+        let shares = parse_volumes(&specs);
+        assert!(shares[0].read_only);
+        assert!(!shares[1].read_only);
+        assert_eq!(shares[0].tag, "share0");
+        assert_eq!(shares[1].tag, "share1");
     }
 }

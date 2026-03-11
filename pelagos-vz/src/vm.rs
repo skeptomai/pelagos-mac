@@ -46,8 +46,8 @@ pub struct VmConfig {
     pub memory_mib: usize,
     /// vsock port the guest daemon listens on (default 1024).
     pub vsock_port: u32,
-    /// Directories to share via virtiofs: (host_path, mount_tag).
-    pub virtiofs_shares: Vec<(PathBuf, String)>,
+    /// Directories to share via virtiofs: (host_path, mount_tag, read_only).
+    pub virtiofs_shares: Vec<(PathBuf, String, bool)>,
     /// Enable Rosetta for x86_64 Linux binaries (macOS 13+).
     pub rosetta: bool,
 }
@@ -67,7 +67,7 @@ pub struct VmConfigBuilder {
     cpus: Option<usize>,
     memory_mib: Option<usize>,
     vsock_port: Option<u32>,
-    virtiofs_shares: Vec<(PathBuf, String)>,
+    virtiofs_shares: Vec<(PathBuf, String, bool)>,
     rosetta: bool,
 }
 
@@ -100,8 +100,13 @@ impl VmConfigBuilder {
         self.vsock_port = Some(p);
         self
     }
-    pub fn virtiofs(mut self, host: impl Into<PathBuf>, tag: impl Into<String>) -> Self {
-        self.virtiofs_shares.push((host.into(), tag.into()));
+    pub fn virtiofs(
+        mut self,
+        host: impl Into<PathBuf>,
+        tag: impl Into<String>,
+        read_only: bool,
+    ) -> Self {
+        self.virtiofs_shares.push((host.into(), tag.into(), read_only));
         self
     }
     pub fn rosetta(mut self, enabled: bool) -> Self {
@@ -405,10 +410,13 @@ unsafe fn start_vm(config: VmConfig) -> Result<Vm, crate::Error> {
 
     // 8. virtiofs directory shares.
     let mut fs_configs: Vec<Retained<VZVirtioFileSystemDeviceConfiguration>> = Vec::new();
-    for (host_path, tag) in &config.virtiofs_shares {
+    for (host_path, tag, read_only) in &config.virtiofs_shares {
         let host_url = file_url(host_path);
-        let shared_dir =
-            VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &host_url, false);
+        let shared_dir = VZSharedDirectory::initWithURL_readOnly(
+            VZSharedDirectory::alloc(),
+            &host_url,
+            *read_only,
+        );
         let share =
             VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &shared_dir);
         let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(

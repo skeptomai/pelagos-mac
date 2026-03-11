@@ -309,6 +309,29 @@ while [ \$i -lt 15 ]; do
     i=\$((i+1))
 done
 
+# Mount virtiofs shares requested by the host.
+# The host appends "virtiofs.tags=share0,share1,..." to the kernel cmdline
+# when -v flags are used.  Parse and mount each tag at /mnt/<tag>.
+CMDLINE=\$(busybox cat /proc/cmdline)
+for kv in \$CMDLINE; do
+    case "\$kv" in
+        virtiofs.tags=*)
+            TAGS="\${kv#virtiofs.tags=}"
+            OLD_IFS="\$IFS"
+            IFS=","
+            for TAG in \$TAGS; do
+                IFS="\$OLD_IFS"
+                busybox mkdir -p "/mnt/\$TAG"
+                busybox mount -t virtiofs "\$TAG" "/mnt/\$TAG" && \
+                    echo "[pelagos-init] mounted virtiofs tag \$TAG at /mnt/\$TAG" || \
+                    echo "[pelagos-init] WARNING: failed to mount virtiofs tag \$TAG" >&2
+                IFS=","
+            done
+            IFS="\$OLD_IFS"
+            ;;
+    esac
+done
+
 export PELAGOS_IMAGE_STORE=/run/pelagos
 
 exec /usr/local/bin/pelagos-guest

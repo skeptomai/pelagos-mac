@@ -24,6 +24,15 @@ pub const VSOCK_PORT: u32 = 1024;
 // Protocol types
 // ---------------------------------------------------------------------------
 
+/// A single virtiofs bind mount to apply inside the container.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GuestMount {
+    /// virtiofs tag — the directory is already mounted at `/mnt/<tag>` in the guest.
+    pub tag: String,
+    /// Absolute path inside the container.
+    pub container_path: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum GuestCommand {
@@ -32,6 +41,8 @@ pub enum GuestCommand {
         args: Vec<String>,
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        mounts: Vec<GuestMount>,
     },
     Ping,
 }
@@ -118,8 +129,8 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 send_response(&mut writer, &GuestResponse::Pong { pong: true })?;
                 return Ok(());
             }
-            GuestCommand::Run { image, args, env } => {
-                run_container(&mut writer, &image, &args, &env)?;
+            GuestCommand::Run { image, args, env, mounts } => {
+                run_container(&mut writer, &image, &args, &env, &mounts)?;
             }
         }
     }
@@ -131,6 +142,7 @@ fn run_container(
     image: &str,
     args: &[String],
     env: &std::collections::HashMap<String, String>,
+    mounts: &[GuestMount],
 ) -> std::io::Result<()> {
     let pelagos = std::env::var("PELAGOS_BIN").unwrap_or_else(|_| "/usr/local/bin/pelagos".into());
 
@@ -203,8 +215,26 @@ fn run_container(
         return Ok(());
     }
 
+    // Ensure each virtiofs mountpoint exists inside the guest before invoking
+    // pelagos run.  The init script already ran `mount -t virtiofs <tag>
+    // /mnt/<tag>` for each tag passed on the kernel cmdline.
+    for mount in mounts {
+        let guest_mnt = format!("/mnt/{}", mount.tag);
+        // The virtiofs directory should already be mounted at /mnt/<tag> by
+        // the init script.  If the mount point is absent something went wrong,
+        // but we proceed and let pelagos report the error rather than silently
+        // dropping the mount.
+        log::debug!("virtiofs share: {} → {}", guest_mnt, mount.container_path);
+    }
+
     let mut cmd = Command::new(&pelagos);
-    cmd.arg("run").arg(image);
+    cmd.arg("run");
+    // Pass each virtiofs guest-side path as a -v bind mount to pelagos run.
+    for mount in mounts {
+        let guest_mnt = format!("/mnt/{}", mount.tag);
+        cmd.arg("-v").arg(format!("{}:{}", guest_mnt, mount.container_path));
+    }
+    cmd.arg(image);
     if !args.is_empty() {
         cmd.args(args);
     }
@@ -435,9 +465,25 @@ mod tests {
         let json = r#"{"cmd":"run","image":"alpine","args":["/bin/echo","hello"]}"#;
         let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
         match cmd {
-            GuestCommand::Run { image, args, .. } => {
+            GuestCommand::Run { image, args, mounts, .. } => {
                 assert_eq!(image, "alpine");
                 assert_eq!(args, vec!["/bin/echo", "hello"]);
+                assert!(mounts.is_empty());
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_with_mounts_deserializes() {
+        let json = r#"{"cmd":"run","image":"alpine","args":["cat","/data/f"],"mounts":[{"tag":"share0","container_path":"/data"}]}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
+        match cmd {
+            GuestCommand::Run { image, mounts, .. } => {
+                assert_eq!(image, "alpine");
+                assert_eq!(mounts.len(), 1);
+                assert_eq!(mounts[0].tag, "share0");
+                assert_eq!(mounts[0].container_path, "/data");
             }
             other => panic!("unexpected: {:?}", other),
         }

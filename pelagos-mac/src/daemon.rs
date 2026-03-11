@@ -20,9 +20,28 @@ use std::time::{Duration, Instant};
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use pelagos_vz::vm::{Vm, VmConfig};
 
 use crate::state::StateDir;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// A single virtiofs host→guest mount.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VirtiofsShare {
+    /// Host directory to expose.
+    pub host_path: PathBuf,
+    /// virtiofs mount tag (`share0`, `share1`, …).
+    pub tag: String,
+    /// Mount the share read-only inside the guest.
+    pub read_only: bool,
+    /// Absolute path inside the container where the share is mounted.
+    pub container_path: String,
+}
 
 // ---------------------------------------------------------------------------
 // Public API used by main.rs
@@ -36,13 +55,28 @@ pub struct DaemonArgs {
     pub cmdline: String,
     pub memory_mib: usize,
     pub cpus: usize,
+    /// virtiofs shares requested for this invocation.
+    pub virtiofs_shares: Vec<VirtiofsShare>,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
 /// Returns Ok(()) once vm.sock is connectable.
+///
+/// If the daemon is already running but was started with a different mount
+/// configuration, returns an error asking the user to run `pelagos vm stop`.
 pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
     let state = StateDir::open()?;
+
     if state.is_daemon_alive() {
+        // Verify that the running daemon was started with the same mounts.
+        let running_mounts = state.read_mounts()?;
+        if running_mounts != args.virtiofs_shares {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "daemon is running with different mount configuration; \
+                 run 'pelagos vm stop' first, then retry",
+            ));
+        }
         return Ok(());
     }
 
@@ -59,6 +93,18 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
     cmd.arg("--cmdline").arg(&args.cmdline);
     cmd.arg("--memory").arg(args.memory_mib.to_string());
     cmd.arg("--cpus").arg(args.cpus.to_string());
+    // Forward virtiofs shares as repeated --volume flags to the daemon subcommand.
+    for share in &args.virtiofs_shares {
+        let mut spec = format!(
+            "{}:{}",
+            share.host_path.display(),
+            share.container_path
+        );
+        if share.read_only {
+            spec.push_str(":ro");
+        }
+        cmd.arg("--volume").arg(&spec);
+    }
     cmd.arg("vm-daemon-internal");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
@@ -128,6 +174,11 @@ pub fn run(args: DaemonArgs) -> ! {
 
     state.write_pid(std::process::id()).unwrap_or_else(|e| {
         log::error!("write pid: {}", e);
+    });
+
+    // Persist mount configuration so subsequent invocations can verify compatibility.
+    state.write_mounts(&args.virtiofs_shares).unwrap_or_else(|e| {
+        log::error!("write mounts: {}", e);
     });
 
     log::info!("daemon listening on {}", state.sock_file.display());
@@ -255,11 +306,28 @@ fn build_vm_config(args: &DaemonArgs) -> VmConfig {
     let mut b = VmConfig::builder()
         .kernel(&args.kernel)
         .disk(&args.disk)
-        .cmdline(&args.cmdline)
+        .cmdline(build_cmdline(args))
         .memory_mib(args.memory_mib)
         .cpus(args.cpus);
     if let Some(ref initrd) = args.initrd {
         b = b.initrd(initrd);
     }
+    for share in &args.virtiofs_shares {
+        b = b.virtiofs(&share.host_path, &share.tag, share.read_only);
+    }
     b.build().expect("vm config")
+}
+
+/// Build the kernel cmdline from DaemonArgs.
+///
+/// Appends `virtiofs.tags=share0,share1,...` when shares are present so the
+/// guest init script can mount them before exec'ing pelagos-guest.
+fn build_cmdline(args: &DaemonArgs) -> String {
+    let mut cmdline = args.cmdline.clone();
+    if !args.virtiofs_shares.is_empty() {
+        let tags: Vec<&str> = args.virtiofs_shares.iter().map(|s| s.tag.as_str()).collect();
+        cmdline.push_str(" virtiofs.tags=");
+        cmdline.push_str(&tags.join(","));
+    }
+    cmdline
 }
