@@ -54,7 +54,8 @@ enum Commands {
     Run {
         /// Container image name (e.g. alpine)
         image: String,
-        /// Arguments to pass to the container
+        /// Arguments to pass to the container (use -- before flags, e.g. -- -c "cmd")
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Ping the guest daemon (readiness check)
@@ -117,6 +118,14 @@ fn main() {
         Commands::Ping => ping_command(&vm),
     };
 
+    // Drop Vm explicitly before exit so stop() runs and bridge100 detaches.
+    // process::exit() bypasses destructors, so without this the VM lingers and
+    // the next run races with the previous bridge100 teardown.
+    drop(vm);
+    // Give InternetSharing time to fully tear down bridge100 and flush PF NAT
+    // state before the process exits.  stop() polls until VZVirtualMachineState::Stopped,
+    // but bridge100 detaches ~1s later in a background IS callback.
+    std::thread::sleep(std::time::Duration::from_secs(2));
     process::exit(exit_code);
 }
 
