@@ -10,6 +10,16 @@
 #   - make image   (builds out/vmlinuz, out/initramfs-custom.gz, out/root.img)
 #   - make sign    (builds and signs target/aarch64-apple-darwin/release/pelagos)
 #
+# Cold-start timing note:
+#   The --cold mode measures a "warm-NAT cold start" — the daemon is stopped
+#   and a fresh VM is booted, but AVF NAT (InternetSharing / bridge100) is
+#   still warm from the previous session.  In this state the ping gate inside
+#   the VM succeeds on the first try (~100 ms) so the total cold start is
+#   ~1-2 s.  On a truly fresh macOS login the first boot can take up to ~50 s
+#   while the ping gate waits for NAT to come up.  If that happens, run:
+#     sudo pfctl -f /etc/pf.conf
+#   to reset PF and let InternetSharing re-establish cleanly.
+#
 # If image pulls fail with "error sending request", PF state has degraded.
 # Fix with: sudo pfctl -f /etc/pf.conf
 
