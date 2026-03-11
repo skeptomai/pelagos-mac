@@ -257,18 +257,17 @@ fi
 
 echo ""
 echo "=== test 7a: vm shell (non-tty) ==="
-# Use shell read built-in — no external commands needed (initramfs has busybox
-# but not all applets are symlinked; 'cat' and 'uname' may be absent).
+# Use /bin/busybox directly — always present in the Alpine initramfs regardless
+# of whether busybox --install created applet symlinks.
 OUT=$(pelagos vm shell <<'VMEOF'
-read ver < /proc/version
-echo "$ver"
+/bin/busybox uname -s
 VMEOF
 )
 echo "$OUT" | grep -v "^\["
-if echo "$OUT" | grep -qi "linux"; then
-    pass "vm shell: /proc/version contains 'Linux' (we are in the VM)"
+if echo "$OUT" | grep -q "^Linux$"; then
+    pass "vm shell: 'uname -s' returned 'Linux' (we are in the VM)"
 else
-    fail "vm shell: expected 'Linux' in /proc/version, got: $(echo "$OUT" | grep -v '^\[')"
+    fail "vm shell: expected 'Linux', got: $(echo "$OUT" | grep -v '^\[')"
 fi
 
 # ---------------------------------------------------------------------------
