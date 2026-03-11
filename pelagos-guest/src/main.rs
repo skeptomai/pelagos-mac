@@ -473,6 +473,9 @@ fn handle_exec_piped(
         loop {
             match recv_frame(&mut reader) {
                 Ok((FRAME_STDIN, data)) => {
+                    if data.is_empty() {
+                        break; // zero-length = EOF signal; drop child_stdin below
+                    }
                     if child_stdin.write_all(&data).is_err() {
                         break;
                     }

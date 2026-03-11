@@ -549,7 +549,13 @@ fn exec_command(stream: UnixStream, image: String, args: Vec<String>, tty: bool)
             // Handle stdin.
             if fds[0].revents & libc::POLLIN != 0 {
                 match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        // EOF — send a zero-length Stdin frame so the guest
+                        // knows to close the child's stdin pipe.
+                        let mut w = writer_stdin.lock().unwrap();
+                        let _ = send_frame(&mut *w, FRAME_STDIN, &[]);
+                        break;
+                    }
                     Ok(n) => {
                         let mut w = writer_stdin.lock().unwrap();
                         if send_frame(&mut *w, FRAME_STDIN, &buf[..n]).is_err() {
@@ -560,6 +566,8 @@ fn exec_command(stream: UnixStream, image: String, args: Vec<String>, tty: bool)
             }
             // If stdin got HUP, stop.
             if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                let mut w = writer_stdin.lock().unwrap();
+                let _ = send_frame(&mut *w, FRAME_STDIN, &[]);
                 break;
             }
         }
