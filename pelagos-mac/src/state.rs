@@ -59,8 +59,9 @@ impl StateDir {
     /// if the file does not exist.
     pub fn read_mounts(&self) -> io::Result<Vec<crate::daemon::VirtiofsShare>> {
         match std::fs::read_to_string(&self.mounts_file) {
-            Ok(s) => serde_json::from_str(&s)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Ok(s) => {
+                serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
         }
@@ -186,6 +187,9 @@ mod tests {
         };
         assert_eq!(s.pid_file, PathBuf::from("/tmp/pelagos-path-test/vm.pid"));
         assert_eq!(s.sock_file, PathBuf::from("/tmp/pelagos-path-test/vm.sock"));
-        assert_eq!(s.mounts_file, PathBuf::from("/tmp/pelagos-path-test/vm.mounts"));
+        assert_eq!(
+            s.mounts_file,
+            PathBuf::from("/tmp/pelagos-path-test/vm.mounts")
+        );
     }
 }

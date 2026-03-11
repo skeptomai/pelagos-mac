@@ -348,7 +348,11 @@ fn run_command(
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut writer = stream;
 
-    let cmd = GuestCommand::Run { image, args, mounts };
+    let cmd = GuestCommand::Run {
+        image,
+        args,
+        mounts,
+    };
     let mut msg = serde_json::to_string(&cmd).unwrap();
     msg.push('\n');
     if let Err(e) = writer.write_all(msg.as_bytes()) {
@@ -494,11 +498,7 @@ fn exec_command(stream: UnixStream, image: String, args: Vec<String>, tty: bool)
     }
 
     // Optionally put the terminal in raw mode.
-    let saved_termios: Option<libc::termios> = if tty {
-        Some(enter_raw_mode())
-    } else {
-        None
-    };
+    let saved_termios: Option<libc::termios> = if tty { Some(enter_raw_mode()) } else { None };
 
     // Spawn stdin-forwarding thread.
     // Uses a pipe to also signal resize events.
@@ -647,8 +647,7 @@ fn create_pipe() -> (libc::c_int, libc::c_int) {
 }
 
 // Global write end of the SIGWINCH pipe.
-static SIGWINCH_PIPE_W: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(-1);
+static SIGWINCH_PIPE_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 extern "C" fn sigwinch_handler(_: libc::c_int) {
     let fd = SIGWINCH_PIPE_W.load(std::sync::atomic::Ordering::Relaxed);

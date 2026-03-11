@@ -98,11 +98,7 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
     cmd.arg("--cpus").arg(args.cpus.to_string());
     // Forward virtiofs shares as repeated --volume flags to the daemon subcommand.
     for share in &args.virtiofs_shares {
-        let mut spec = format!(
-            "{}:{}",
-            share.host_path.display(),
-            share.container_path
-        );
+        let mut spec = format!("{}:{}", share.host_path.display(), share.container_path);
         if share.read_only {
             spec.push_str(":ro");
         }
@@ -180,9 +176,11 @@ pub fn run(args: DaemonArgs) -> ! {
     });
 
     // Persist mount configuration so subsequent invocations can verify compatibility.
-    state.write_mounts(&args.virtiofs_shares).unwrap_or_else(|e| {
-        log::error!("write mounts: {}", e);
-    });
+    state
+        .write_mounts(&args.virtiofs_shares)
+        .unwrap_or_else(|e| {
+            log::error!("write mounts: {}", e);
+        });
 
     log::info!("daemon listening on {}", state.sock_file.display());
 
@@ -372,7 +370,10 @@ mod tests {
 
     #[test]
     fn cmdline_no_shares() {
-        assert_eq!(build_cmdline_from_parts("console=hvc0", &[]), "console=hvc0");
+        assert_eq!(
+            build_cmdline_from_parts("console=hvc0", &[]),
+            "console=hvc0"
+        );
     }
 
     #[test]
