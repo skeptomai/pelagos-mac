@@ -269,7 +269,13 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
             GuestCommand::Shell { tty } => {
                 // Send ready ack — switches the connection to framed binary protocol.
                 send_response(&mut writer, &GuestResponse::Ready { ready: true })?;
-                let cmd = Command::new("/bin/sh");
+                let mut cmd = Command::new("/bin/sh");
+                // Set a sane PATH so busybox applet symlinks are findable.
+                // pelagos-guest may not inherit PATH from the init script.
+                cmd.env(
+                    "PATH",
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                );
                 if tty {
                     handle_exec_tty(fd, cmd)?;
                 } else {
