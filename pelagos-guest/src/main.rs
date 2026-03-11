@@ -178,10 +178,20 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 send_response(&mut writer, &GuestResponse::Pong { pong: true })?;
                 return Ok(());
             }
-            GuestCommand::Run { image, args, env, mounts } => {
+            GuestCommand::Run {
+                image,
+                args,
+                env,
+                mounts,
+            } => {
                 run_container(&mut writer, &image, &args, &env, &mounts)?;
             }
-            GuestCommand::Exec { image, args, env, tty } => {
+            GuestCommand::Exec {
+                image,
+                args,
+                env,
+                tty,
+            } => {
                 handle_exec(fd, &image, &args, &env, tty)?;
                 return Ok(());
             }
@@ -254,10 +264,7 @@ fn pull_image(writer: &mut impl Write, image: &str) -> std::io::Result<bool> {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
-    send_response(
-        writer,
-        &GuestResponse::Error { error: pull_error },
-    )?;
+    send_response(writer, &GuestResponse::Error { error: pull_error })?;
     Ok(false)
 }
 
@@ -291,7 +298,8 @@ fn run_container(
     // Pass each virtiofs guest-side path as a -v bind mount to pelagos run.
     for mount in mounts {
         let guest_mnt = format!("/mnt/{}", mount.tag);
-        cmd.arg("-v").arg(format!("{}:{}", guest_mnt, mount.container_path));
+        cmd.arg("-v")
+            .arg(format!("{}:{}", guest_mnt, mount.container_path));
     }
     cmd.arg(image);
     if !args.is_empty() {
@@ -629,11 +637,7 @@ fn handle_exec_tty(
                 Ok((FRAME_STDIN, data)) => {
                     let mfd = master_write2.lock().unwrap();
                     let ret = unsafe {
-                        libc::write(
-                            *mfd,
-                            data.as_ptr() as *const libc::c_void,
-                            data.len(),
-                        )
+                        libc::write(*mfd, data.as_ptr() as *const libc::c_void, data.len())
                     };
                     if ret < 0 {
                         break;
@@ -834,7 +838,12 @@ mod tests {
         let json = r#"{"cmd":"run","image":"alpine","args":["/bin/echo","hello"]}"#;
         let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
         match cmd {
-            GuestCommand::Run { image, args, mounts, .. } => {
+            GuestCommand::Run {
+                image,
+                args,
+                mounts,
+                ..
+            } => {
                 assert_eq!(image, "alpine");
                 assert_eq!(args, vec!["/bin/echo", "hello"]);
                 assert!(mounts.is_empty());
@@ -848,7 +857,9 @@ mod tests {
         let json = r#"{"cmd":"exec","image":"alpine","args":["sh"],"tty":true}"#;
         let cmd: GuestCommand = serde_json::from_str(json).expect("parse failed");
         match cmd {
-            GuestCommand::Exec { image, args, tty, .. } => {
+            GuestCommand::Exec {
+                image, args, tty, ..
+            } => {
                 assert_eq!(image, "alpine");
                 assert_eq!(args, vec!["sh"]);
                 assert!(tty);
