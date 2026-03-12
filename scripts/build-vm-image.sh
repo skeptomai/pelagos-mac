@@ -265,7 +265,10 @@ echo "  (using repo bundle: $CA_BUNDLE)"
 # ---------------------------------------------------------------------------
 echo "[7/8] Building custom initramfs"
 # ---------------------------------------------------------------------------
-if [ ! -f "$INITRAMFS_OUT" ]; then
+if [ ! -f "$INITRAMFS_OUT" ] \
+    || [ "$GUEST_BIN"   -nt "$INITRAMFS_OUT" ] \
+    || [ "$PELAGOS_BIN" -nt "$INITRAMFS_OUT" ] \
+    || [ "$0"           -nt "$INITRAMFS_OUT" ]; then
     KVER="6.12.1-3-virt"
 
     # --- Extract vsock modules from the modloop squashfs ---
