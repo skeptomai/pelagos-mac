@@ -1,13 +1,14 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-12, SHA 45206c7 (post-PR #59)*
+*Last updated: 2026-03-12, SHA e2e77c6 (post-PR #63)*
 
 ---
 
 ## Current State
 
-**Phase 2 + Phase 3 VM Access COMPLETE.** The full container lifecycle and all three
-VM access modes work end-to-end on real hardware. All 18 e2e tests pass (`bash scripts/test-e2e.sh`).
+**Phase 2 + Phase 3 VM Access COMPLETE. Phase 4 partially complete.** The full container
+lifecycle and all three VM access modes work end-to-end on real hardware. All 30 e2e tests
+pass (`bash scripts/test-e2e.sh`).
 
 ### What works today
 
@@ -67,16 +68,19 @@ Goal: make pelagos-mac a backend for the [devcontainer CLI](https://github.com/d
 
 | Subtask | Issue | Status |
 |---|---|---|
-| Docker CLI shim (`pelagos-docker`) | #56 | Not started |
+| Docker CLI shim (`pelagos-docker`) | #56 | ✅ Done (PR #62 + #63) |
 | Native port forwarding (`-p host:container`) | #57 | ✅ Done (PR #59) |
-| glibc/Ubuntu container image compatibility | #58 | Not started |
+| glibc/Ubuntu container image compatibility | #58 | ✅ Done (PR #61) |
 
-Port forwarding merged in PR #59. Daemon binds `TcpListener` on the host and
-proxies to `192.168.105.2:container_port` in the VM. Verified via e2e test 7e.
+- Port forwarding (PR #59): daemon binds `TcpListener` on host, proxies to `192.168.105.2:container_port`.
+- Ubuntu/glibc (PR #61): resolv.conf bind-mount workaround in pelagos-guest; deeper fix tracked in issue #60.
+- Docker shim (PR #62+#63): `pelagos-docker` binary mapping Docker CLI to `pelagos` subcommands;
+  sidecar labels JSON; auto-detects pelagos binary. `-e/--env` wired end-to-end. Full e2e test suite added.
 
-**Recommended next: #56 (Docker CLI shim) or #58 (glibc/Ubuntu compat).**
-Both are now unblocked. The shim (#56) lets `docker run` delegate to pelagos;
-#58 opens Ubuntu/glibc containers which are required for most devcontainer templates.
+**Remaining Phase 4 work:**
+- issue #60: make pelagos runtime handle DNS natively (no guest-side workaround)
+- Rosetta support (Phase 2 Task C) — still not started
+- devcontainer CLI integration testing
 
 See `docs/VM_LIFECYCLE.md` for the VM networking topology (socket_vmnet,
 192.168.105.x subnet).
