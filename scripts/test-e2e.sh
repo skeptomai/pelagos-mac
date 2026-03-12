@@ -362,6 +362,28 @@ pelagos vm stop > /dev/null 2>&1 || true
 sleep 1
 
 # ---------------------------------------------------------------------------
+# Test 7f: Ubuntu 24.04 container with apt-get (glibc + DNS)
+#
+# Verifies that glibc containers work and that DNS is functional inside them
+# (pelagos-guest bind-mounts /etc/resolv.conf from the VM).
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== test 7f: Ubuntu 24.04 apt-get (glibc + DNS) ==="
+OUT=$("$BINARY" \
+    --kernel  "$KERNEL" \
+    --initrd  "$INITRD" \
+    --disk    "$DISK" \
+    --cmdline "$CMDLINE" \
+    run public.ecr.aws/docker/library/ubuntu:24.04 \
+    /bin/bash -c "apt-get update -qq && echo apt-ok" 2>&1)
+if echo "$OUT" | grep -q "apt-ok"; then
+    pass "ubuntu 24.04: apt-get update succeeded (glibc + DNS working)"
+else
+    fail "ubuntu 24.04: apt-get update failed; output: $(echo "$OUT" | grep -v '^\[')"
+fi
+
+# ---------------------------------------------------------------------------
 # Tests 8-13: container lifecycle (ps, logs, stop, rm, --name, --detach)
 #
 # Requires the daemon to be running without mounts; restarts clean after
