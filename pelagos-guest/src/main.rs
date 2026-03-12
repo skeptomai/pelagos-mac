@@ -1105,6 +1105,20 @@ fn handle_exec(
 /// in the forked child — after fork but before exec.  This is critical: calling
 /// setns in the parent thread would affect all other guest threads, corrupting
 /// the daemon for every concurrent connection.
+///
+/// # Why `pelagos exec` subprocess CANNOT be used here
+///
+/// `pelagos exec` (the Linux pelagos CLI) **always skips the PID namespace join**
+/// when running rootless containers.  `setns(CLONE_NEWPID)` only updates
+/// `pid_for_children`; a subsequent fork() is required to enter the namespace,
+/// and that double-fork happens inside container.rs before `pre_exec` runs —
+/// too late to redo it.  As a result, a subprocess calling `pelagos exec` runs
+/// in the guest's root filesystem, not the container's.  The failure is silent:
+/// exit 0, wrong data.
+///
+/// Any guest code that runs commands inside a container MUST use the direct
+/// setns pattern shown here and in `handle_cp_from` / `handle_cp_to`.
+/// See docs/GUEST_CONTAINER_EXEC.md for the full analysis and a reusable template.
 fn handle_exec_into(
     fd: libc::c_int,
     container: &str,
