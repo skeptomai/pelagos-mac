@@ -1,13 +1,13 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-12, SHA e2e77c6 (post-PR #63)*
+*Last updated: 2026-03-12, SHA fb924b7 (post-PR #65)*
 
 ---
 
 ## Current State
 
-**Phase 2 + Phase 3 VM Access COMPLETE. Phase 4 partially complete.** The full container
-lifecycle and all three VM access modes work end-to-end on real hardware. All 30 e2e tests
+**Phase 2 + Phase 3 VM Access COMPLETE. Phase 4 largely complete.** The full container
+lifecycle and all three VM access modes work end-to-end on real hardware. All 31 e2e tests
 pass (`bash scripts/test-e2e.sh`).
 
 ### What works today
@@ -79,8 +79,8 @@ Goal: make pelagos-mac a backend for the [devcontainer CLI](https://github.com/d
 
 **Remaining Phase 4 work:**
 - issue #60: make pelagos runtime handle DNS natively (no guest-side workaround)
-- Rosetta support (Phase 2 Task C) — still not started
-- devcontainer CLI integration testing
+- devcontainer CLI real integration test: `devcontainer up --docker-path pelagos-docker` against a minimal ubuntu devcontainer (requires npm + @devcontainers/cli)
+- issue #64 closed (PR #65): docker exec, version, info, inspect auto-detect all done
 
 See `docs/VM_LIFECYCLE.md` for the VM networking topology (socket_vmnet,
 192.168.105.x subnet).
