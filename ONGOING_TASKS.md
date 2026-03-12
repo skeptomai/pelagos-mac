@@ -1,165 +1,76 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-10, post-Phase-1*
+*Last updated: 2026-03-11, SHA 60c9b83 (post-PR #50)*
 
 ---
 
 ## Current State
 
-**Phase 0 pilot COMPLETE.** `pelagos ping` returns `pong` end-to-end on real hardware.
+**Phase 2 COMPLETE.** The full container lifecycle works end-to-end on real hardware.
+All 16 e2e tests pass (`bash scripts/test-e2e.sh`).
 
-The full stack has been exercised:
-- macOS host boots a Linux/Alpine ARM64 VM via `objc2-virtualization`
-- vsock round-trip works: host sends `{"cmd":"ping"}`, guest replies `{"pong":true}`
-- No Go binary at any layer
+### What works today
 
----
-
-## Phase 0 — Pilot: Validate the Architecture ✅
-
-### Task 0.1 — ✅ Verify objc2-virtualization crate versions
-
-Versions pinned: `objc2 0.6`, `objc2-foundation 0.3`, `objc2-virtualization 0.3`,
-`block2 0.6`, `dispatch2 0.3`.
-
-### Task 0.2 — ✅ Implement pelagos-vz: boot a minimal Linux VM
-
-`pelagos-vz/src/vm.rs` — `VmConfig` / `VmConfigBuilder`, `Vm::start()`,
-`Vm::connect_vsock()`, `Vm::stop()`.
-
-Key pattern: AVF async callbacks bridged to sync Rust via
-`Arc<Mutex<Option<Result>>>` + `Arc<Condvar>`, dispatched through the VM's serial
-`DispatchQueue`.
-
-**Critical bug found and fixed during pilot (see below).**
-
-### Task 0.3 — ✅ Implement pelagos-guest: vsock listener
-
-`pelagos-guest/src/main.rs`:
-- AF_VSOCK listener via `libc` directly (Linux only; macOS stubs for `cargo check`)
-- JSON command dispatch: `GuestCommand::Ping` → `{"pong":true}`, `GuestCommand::Run`
-  → spawns `pelagos run`, streams stdout/stderr, returns exit code
-- `FdReader` / `FdWriter` structs for direct `libc::read`/`libc::write` — avoids
-  `OwnedFd::from_raw_fd` on connection sockets (irrelevant to the actual bug but
-  cleaner and safer with Rust 1.84+ assertions)
-- `ConnFd` RAII wrapper closes the accepted connection fd on all exit paths
-
-### Task 0.4 — ✅ Implement vsock client in pelagos-mac
-
-`pelagos-mac/src/main.rs` — `run_command()` and `ping_command()`.
-
-### Task 0.5 — ✅ Wire up the CLI
-
-clap 4 derive CLI: `pelagos --kernel K --initrd I --disk D ping|run`.
-
-### Task 0.6 — ✅ Build VM image script
-
-`scripts/build-vm-image.sh` (no QEMU, no ext4, no interactive install):
-- Downloads Alpine 3.21 aarch64 virt ISO
-- Extracts `vmlinuz-virt` + `initramfs-virt` via `bsdtar`
-- Decompresses zboot kernel to raw arm64 Image (macOS 26 / VZLinuxBootLoader
-  requires an uncompressed arm64 Image, not gzip or zboot format)
-- Cross-compiles `pelagos-guest` for `aarch64-unknown-linux-musl`
-- Extracts vsock kernel modules from the ISO's modloop squashfs
-- Repacks initramfs with guest binary + vsock modules + custom `/init`
-- Creates 64 MiB placeholder disk image (AVF requires at least one block device)
-
-### Task 0.7 — ✅ Code-sign and run end-to-end ping
-
-```bash
-codesign --sign - --entitlements pelagos-mac/entitlements.plist --force \
-    target/aarch64-apple-darwin/release/pelagos
-
-RUST_LOG=info ./target/aarch64-apple-darwin/release/pelagos \
-    --kernel out/vmlinuz --initrd out/initramfs-custom.gz --disk out/root.img \
-    --cmdline 'console=hvc0' ping
-# → pong
-```
+| Feature | Status | Merged |
+|---|---|---|
+| VM boot via AVF | ✅ | Phase 0 |
+| vsock round-trip (ping/pong) | ✅ | Phase 0 |
+| `pelagos run` (pull + exec) | ✅ | PR #18 |
+| Persistent daemon (warm reuse) | ✅ | PR #27 |
+| virtiofs bind mounts (`-v`) | ✅ | PR #28 |
+| `pelagos exec` (piped + PTY) | ✅ | PR #38 |
+| `pelagos ps / logs / stop / rm` | ✅ | PR #37 |
+| `pelagos run --detach --name` | ✅ | PR #37 |
+| `pelagos vm shell` | ✅ | PR #45 |
+| Busybox applet symlinks in VM | ✅ | PR #47 |
+| Persistent OCI image cache (`/dev/vda` ext2) | ✅ | PR #50 |
+| ECR Public test image (no rate limits) | ✅ | PR #50 |
+| devpts mount + PTY job control | ✅ | PR #38/#40 |
 
 ---
 
-## Bugs Found and Fixed During Pilot
+## Phase 3 — VM Access (Epic #41)
 
-### Bug 1: Cross-compilation toolchain (cargo-zigbuild broken)
+Three options for direct VM access beyond `pelagos vm shell` (vsock-based shell):
 
-**Symptom:** `can't find crate for core/std` when building for
-`aarch64-unknown-linux-musl`.
+### Option A — `pelagos vm shell` (vsock) ✅ DONE (PR #45)
 
-**Root cause:** Homebrew's `cargo`/`rustc` is on PATH and lacks the musl sysroot.
-`cargo-zigbuild` was also broken (its managed zig cache had been deleted and
-couldn't re-download).
+Interactive `/bin/sh` inside the VM over vsock. No container namespaces.
+TTY and non-TTY modes both work.
 
-**Fix:**
-- Added `scripts/zig-aarch64-linux-musl.sh` — a direct `zig cc -target
-  aarch64-linux-musl -nostartfiles` wrapper used as the musl linker
-- Build command now uses explicit `RUSTC` path and `-C link-self-contained=no`:
-  ```bash
-  RUSTFLAGS="-C link-self-contained=no" \
-  RUSTC="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc" \
-  cargo build -p pelagos-guest --target aarch64-unknown-linux-musl --release
-  ```
-- Documented in `.cargo/config.toml` and `ONGOING_TASKS.md`
+### Option B — hvc0 serial console (issue #43) ← NEXT
 
-### Bug 2: macOS 26 kernel format rejection
+Wire AVF's `VZVirtioConsoleDeviceSerialPortConfiguration` to the host terminal.
+Lets you watch raw boot output and drop into a login prompt.
+No guest changes needed — the kernel already writes to hvc0.
 
-**Symptom:** VM fails to start; `VZLinuxBootLoader` rejects the kernel.
+### Option C — SSH (issue #44)
 
-**Root cause:** Alpine 3.21's `vmlinuz-virt` is a zboot-format binary (EFI/PE stub
-wrapping a gzip-compressed arm64 Image). macOS 26's `VZLinuxBootLoader` requires a
-raw arm64 Image.
-
-**Fix:** Python 3 decompression step in `build-vm-image.sh` that detects the zboot
-magic bytes, extracts the gzip payload, and decompresses to a raw arm64 Image.
-
-### Bug 3: `VZVirtioSocketConnection` fd lifetime (the pilot-blocking bug)
-
-**Symptom:** `thread 'main' panicked at raw.rs:183: fd != -1` on the host immediately
-after vsock connect. Exit code 101.
-
-**Root cause:** `VZVirtioSocketConnection` is an Objective-C ARC object.
-`fileDescriptor()` returns the raw fd, but the connection object **closes the fd when
-it is deallocated**. ARC releases the connection as soon as the completion handler
-block returns — before the Rust caller has a chance to use the fd.
-
-The sequence of events:
-1. AVF calls the completion handler with a valid `VZVirtioSocketConnection`
-2. Handler reads `conn.fileDescriptor()` → e.g. fd 8
-3. Handler stores fd 8 in the shared `Result`, signals the condvar, and **returns**
-4. ARC releases the connection → its dealloc **closes fd 8**
-5. Rust thread wakes, calls `libc::dup(8)` in `ping_command` → EBADF → returns -1
-6. `std::fs::File::from_raw_fd(-1)` → `OwnedFd::from_raw_fd(-1)` → panic (Rust 1.84+
-   assertion)
-
-**Fix** (`pelagos-vz/src/vm.rs`): call `libc::dup(fd)` **inside** the completion
-handler block, before returning, so we own a copy of the fd that the connection's
-dealloc cannot close:
-
-```rust
-let fd = unsafe { (&*conn).fileDescriptor() };
-if fd < 0 {
-    Err(format!("invalid fileDescriptor: {}", fd))
-} else {
-    // dup() here — AVF closes conn's fd when the ObjC object is deallocated
-    // (ARC), which happens as soon as this block returns.
-    let owned = unsafe { libc::dup(fd) };
-    if owned < 0 {
-        Err(format!("dup failed: {}", std::io::Error::last_os_error()))
-    } else {
-        Ok(owned)
-    }
-}
-```
+Run `dropbear` (small sshd) inside the VM. Requires socket_vmnet or port-forward
+to reach the VM from the host. Deferred until socket_vmnet is done.
 
 ---
 
-## Coding Conventions Established
+## Phase 3 — NAT Reliability (issue #26)
 
-- **No `eprintln!`/`println!` for diagnostics** — use `log::error!`, `log::warn!`,
-  `log::info!`, `log::debug!`, `log::trace!`. `println!` only for deliberate CLI
-  output (e.g. `pong`).
-- All crates use `env_logger` for initialization.
-- Set `RUST_LOG=info` to see lifecycle messages; `RUST_LOG=debug` for connection-level
-  detail.
+`VZNATNetworkDeviceAttachment` (InternetSharing / bridge100) degrades after several
+VM lifecycles: ICMP survives but all TCP fails. Recovery: `sudo pfctl -f /etc/pf.conf`.
+
+**Root fix: migrate to socket_vmnet** (Apache 2.0, no restricted entitlement).
+- socket_vmnet runs as a privileged helper; guest uses `virtio-net` as normal
+- Eliminates the PF/InternetSharing dependency entirely
+- Also unblocks Option C (SSH) by giving the VM a stable reachable IP
+
+Stress test script: `scripts/test-nat-stress.sh 40`
+
+---
+
+## Phase 3 — Signed Installer (not yet tracked)
+
+`.pkg` installer for distribution. Requires:
+- Developer ID Application signature + notarization
+- Hardened runtime entitlement
+- `com.apple.security.virtualization` in the signed entitlements
 
 ---
 
@@ -171,103 +82,7 @@ if fd < 0 {
 | Guest (cross) | `RUSTFLAGS="-C link-self-contained=no" RUSTC="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc" cargo build -p pelagos-guest --target aarch64-unknown-linux-musl --release` |
 | VM image | `bash scripts/build-vm-image.sh` |
 | Code-sign | `codesign --sign - --entitlements pelagos-mac/entitlements.plist --force target/aarch64-apple-darwin/release/pelagos` |
-| Ping test | `RUST_LOG=info ./target/aarch64-apple-darwin/release/pelagos --kernel out/vmlinuz --initrd out/initramfs-custom.gz --disk out/root.img --cmdline 'console=hvc0' ping` |
-
----
-
-## Phase 1 — `pelagos run` End-to-End (Epic #10) ✅
-
-### Task 1.1 — ✅ VM init: kernel filesystem mounts (#11, PR #15)
-
-`/init` now mounts devtmpfs, proc, sysfs, and cgroup2 before exec'ing
-`pelagos-guest`. Mountpoints (`/proc`, `/sys`, `/dev`) created in initramfs.
-
-### Task 1.2 — ✅ VM networking: NAT + DHCP + DNS (#12, PR #16)
-
-`/init` brings up `lo` and `eth0` via `busybox udhcpc`. Writes `/etc/resolv.conf`
-(8.8.8.8 / 8.8.4.4). Host side (`VZNATNetworkDeviceAttachment`) was already present
-in `pelagos-vz/src/vm.rs`.
-
-### Task 1.3 — ✅ Bundle pelagos runtime binary (#13, PR #17)
-
-`build-vm-image.sh` now downloads `pelagos-aarch64-linux` (static musl, v0.24.0)
-from the skeptomai/pelagos GitHub release and installs it at `/usr/local/bin/pelagos`
-in the initramfs. Sets `PELAGOS_IMAGE_STORE=/run/pelagos` in `/init`.
-
-### Task 1.4 — ✅ Protocol tests for `pelagos run` (#14, PR #18)
-
-Added unit tests covering `GuestCommand::Run`/`Ping` serialization and
-`GuestResponse::Stream`/`Exit`/`Pong` deserialization. The `run_command` function
-was already implemented in `pelagos-mac/src/main.rs`.
-
-**End-to-end verified:** `pelagos run alpine /bin/echo hello` outputs `hello`, confirmed
-twice in a row on real hardware (2026-03-10).
-
-**Key bugs discovered and fixed during Phase 1:**
-- `pelagos run` does not auto-pull — `pelagos-guest` now calls `pelagos image pull`
-  first, streams its output back as stderr, checks exit status.
-- `CONFIG_PACKET=n` in Alpine virt kernel — `busybox udhcpc` cannot use raw sockets;
-  switched to static IP (`192.168.64.2/24`, gateway `192.168.64.1`) since AVF NAT
-  always uses `192.168.64.0/24`.
-- `virtio_net.ko` not built into Alpine virt kernel — loads `failover.ko`,
-  `net_failover.ko`, `virtio_net.ko` from modloop in `/init`.
-- `/tmp` missing — pelagos writes temp files during OCI layer download; added
-  `busybox mount -t tmpfs tmpfs /tmp` to init.
-- CA bundle missing — static musl binary needs `/etc/ssl/certs/ca-certificates.crt`;
-  sourced from `/opt/homebrew/share/ca-certificates/cacert.pem` at build time.
-- `com.apple.vm.networking` entitlement — private/restricted Apple entitlement; using
-  it with ad-hoc signing causes macOS to SIGKILL the process (exit 137). Not used.
-- AVF NAT warmup race — pelagos's first outbound TCP connection races with NAT
-  initialization; fixed by pinging 8.8.8.8 in init before exec'ing pelagos-guest.
-
----
-
-## Phase 2 — Post-Run
-
-- PID file / persistent VM (don't reboot on every invocation)
-- virtiofs bind mounts in `pelagos run -v host:container`
-- Rosetta for x86_64 images
-- `pelagos build`, `pelagos image pull` forwarded to guest
-- `pelagos exec`, `pelagos ps`, `pelagos logs`
-- Signed `.pkg` installer
-
----
-
-## Notes and Risks
-
-- `objc2-virtualization` is auto-generated from Xcode SDK headers — complete but
-  not ergonomic. `pelagos-vz` provides the ergonomic wrapper.
-- `com.apple.security.virtualization` entitlement required. Ad-hoc signing works
-  for development.
-- vsock connect: `VZVirtioSocketDevice::connectToPort_completionHandler` connects
-  host→guest. The guest must be listening before the host connects — `connect_vsock()`
-  includes a 60-attempt retry loop with 1-second backoff (covers 45s ping-gate worst-case).
-- virtiofsd (host side) not yet wired in — Phase 2 item.
-- macOS 13.5+ required for full feature set.
-- The `com.apple.security.virtualization` entitlement is required at runtime; the
-  binary must be signed before execution.
-
-### ⚠️ Known: PF/NAT state degrades after ~5 VM runs (issue #26)
-
-`VZNATNetworkDeviceAttachment` uses macOS `InternetSharing` to manage `bridge100`
-and install packet-filter (PF) NAT masquerade rules. After several VM lifecycles,
-InternetSharing loses its PF device connection:
-
-```
-InternetSharing: [com.apple.pf:framework] connection error: Connection invalid
-```
-
-When this happens, ICMP (ping) still routes but all TCP connections from inside
-the VM fail, causing `pelagos image pull` to fail with "error sending request".
-
-**Workaround:**
-```bash
-sudo pfctl -f /etc/pf.conf
-```
-
-This reloads PF from scratch and lets InternetSharing re-establish cleanly.
-Symptoms: image pulls all fail with "error sending request for url (https://...)".
-`launchctl stop/start com.apple.InternetSharing` does NOT fix it.
-
-**Long-term fix:** persistent VM (Phase 2 Task D) sidesteps this entirely by
-reusing one VM across many `pelagos run` calls instead of booting fresh each time.
+| All tests | `bash scripts/test-e2e.sh` |
+| Cold-start test | `bash scripts/test-e2e.sh --cold` |
+| Interactive container | `bash scripts/test-interactive.sh` |
+| VM shell | `bash scripts/vm-shell.sh` |
