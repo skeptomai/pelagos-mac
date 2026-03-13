@@ -1365,7 +1365,33 @@ unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
     panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
 }
 
-/// Open the container's root directory as an fd via `/proc/<pid>/root`.
+/// Resolve the PID that actually called `pivot_root` for the container.
+///
+/// `pelagos ps` returns `state.pid = P`, the intermediate process spawned by
+/// pelagos.  When a PID namespace is active, P never calls `pivot_root` — that
+/// is done by C, P's only child (PID 1 inside the container).  P's
+/// `/proc/P/root` therefore points to the Alpine (host) root, not the
+/// container's overlay.
+///
+/// If P has exactly one child, that child is C.  Otherwise (no PID namespace,
+/// or the container has forked additional children) P itself is the container
+/// process and its `/proc/P/root` is correct.  Same logic as pelagos's own
+/// `find_root_pid()` in `src/cli/exec.rs`.
+fn find_root_pid(pid: u32) -> u32 {
+    let path = format!("/proc/{}/task/{}/children", pid, pid);
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let children: Vec<u32> = content
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if children.len() == 1 {
+            return children[0];
+        }
+    }
+    pid
+}
+
+/// Open the container's root directory as an fd via `/proc/<root_pid>/root`.
 ///
 /// `setns(CLONE_NEWNS)` changes the mount namespace but does NOT update the
 /// calling process's root dentry — absolute paths still resolve through the
@@ -1374,10 +1400,14 @@ unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
 /// correct pattern for entering the container's rootfs (same approach as
 /// pelagos's own exec.rs / nsenter(1)).
 ///
+/// Uses `find_root_pid` to resolve P → C when a PID namespace is active, so
+/// that we open the root of the process that actually called `pivot_root`.
+///
 /// Must be opened in the parent (before fork) while `/proc/<pid>/root` is
 /// still accessible.  No O_CLOEXEC: fd must survive into pre_exec.
 fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
-    let path = format!("/proc/{}/root", pid);
+    let root_pid = find_root_pid(pid);
+    let path = format!("/proc/{}/root", root_pid);
     let cpath = std::ffi::CString::new(path.as_str())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
