@@ -599,18 +599,13 @@ fn main() {
             let container = container.clone();
             let args = args.clone();
             let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
-            // exec-into requires the daemon to already be running (the container must
-            // exist). Do NOT call ensure_running: it would fail if the daemon was
-            // started with different mounts than what exec-into would specify.
-            let state = match state::StateDir::open() {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("failed to open state dir: {}", e);
-                    process::exit(1);
-                }
-            };
-            if !state.is_daemon_alive() {
-                log::error!("no VM daemon running; start a container first");
+            // Fix A ensures all commands start the daemon with the same virtiofs
+            // shares ($HOME as share0), so ensure_running is safe here — no
+            // mount-mismatch risk. Auto-start the VM if it has shut down since
+            // the last container run (e.g. between probe exit and docker exec).
+            let daemon_args = daemon_args_from_cli(&cli);
+            if let Err(e) = daemon::ensure_running(&daemon_args) {
+                log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
             let stream = connect_or_exit();

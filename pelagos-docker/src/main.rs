@@ -184,20 +184,9 @@ enum DockerCmd {
         /// Do not use the cache.
         #[arg(long)]
         no_cache: bool,
-        /// Set the target build stage in a multi-stage Dockerfile.
-        #[arg(long)]
-        target: Option<String>,
         /// Build context path (default: .).
         #[arg(default_value = ".")]
         context: String,
-    },
-
-    /// BuildKit stub — not supported; exits 1 so callers fall back to plain build.
-    #[command(name = "buildx")]
-    Buildx {
-        /// Subcommand and args (ignored).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<String>,
     },
 
     /// Manage named volumes.
@@ -206,9 +195,6 @@ enum DockerCmd {
         sub: String,
         /// Volume name.
         name: Option<String>,
-        /// Only display volume names.
-        #[arg(short = 'q', long = "quiet")]
-        quiet: bool,
     },
 
     /// Manage named networks.
@@ -217,9 +203,6 @@ enum DockerCmd {
         sub: String,
         /// Network name.
         name: Option<String>,
-        /// Only display network IDs.
-        #[arg(short = 'q', long = "quiet")]
-        quiet: bool,
     },
 
     /// Copy files between the host and a running container.
@@ -316,20 +299,10 @@ fn main() {
             file,
             build_args,
             no_cache,
-            target,
             context,
-        } => cmd_build(
-            &cfg,
-            &tag,
-            &file,
-            &build_args,
-            no_cache,
-            target.as_deref(),
-            &context,
-        ),
-        DockerCmd::Buildx { .. } => 1,
-        DockerCmd::Volume { sub, name, quiet } => cmd_volume(&cfg, &sub, name.as_deref(), quiet),
-        DockerCmd::Network { sub, name, quiet } => cmd_network(&cfg, &sub, name.as_deref(), quiet),
+        } => cmd_build(&cfg, &tag, &file, &build_args, no_cache, &context),
+        DockerCmd::Volume { sub, name } => cmd_volume(&cfg, &sub, name.as_deref()),
+        DockerCmd::Network { sub, name } => cmd_network(&cfg, &sub, name.as_deref()),
         DockerCmd::Cp { src, dst } => cmd_cp(&cfg, &src, &dst),
     };
 
@@ -386,17 +359,11 @@ struct RunOpts {
 }
 
 /// Parse `--mount type=bind,source=X,target=Y[,...]` into a `-v X:Y` string.
-/// Returns `None` for `type=volume` mounts (named volumes are not host-path
-/// virtiofs shares and are silently skipped — they are managed by the
-/// pelagos runtime inside the VM).
 fn parse_mount_as_volume(mount_spec: &str) -> Option<String> {
-    let mut mount_type: Option<&str> = None;
     let mut source = None;
     let mut target = None;
     for part in mount_spec.split(',') {
-        if let Some(v) = part.strip_prefix("type=") {
-            mount_type = Some(v);
-        } else if let Some(v) = part.strip_prefix("source=") {
+        if let Some(v) = part.strip_prefix("source=") {
             source = Some(v);
         } else if let Some(v) = part.strip_prefix("src=") {
             source = Some(v);
@@ -407,10 +374,6 @@ fn parse_mount_as_volume(mount_spec: &str) -> Option<String> {
         } else if let Some(v) = part.strip_prefix("destination=") {
             target = Some(v);
         }
-    }
-    // Named volumes (type=volume) are not host-path shares; skip them.
-    if mount_type == Some("volume") {
-        return None;
     }
     match (source, target) {
         (Some(s), Some(t)) => Some(format!("{}:{}", s, t)),
@@ -1006,7 +969,6 @@ fn cmd_build(
     file: &str,
     build_args: &[String],
     no_cache: bool,
-    target: Option<&str>,
     context: &str,
 ) -> i32 {
     let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", file]);
@@ -1017,11 +979,6 @@ fn cmd_build(
     if no_cache {
         sub.push("--no-cache".into());
     }
-    // --target is accepted but not forwarded: pelagos build does not yet support
-    // multi-stage target selection. The devcontainer CLI always makes
-    // dev_containers_target_stage the final stage, so omitting --target produces
-    // the same image. Re-wire once pelagos build gains --target support.
-    let _ = target;
     sub.push(context.into());
     match run_pelagos_inherited(cfg, &sub) {
         Ok(s) => s.code().unwrap_or(1),
@@ -1032,26 +989,10 @@ fn cmd_build(
     }
 }
 
-fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>, quiet: bool) -> i32 {
+fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
     let mut a: Vec<OsString> = args(&["volume", sub]);
     if let Some(n) = name {
         a.push(n.into());
-    }
-    // -q/--quiet for `volume ls`: capture output and print only the name column.
-    if quiet && sub == "ls" {
-        let out = match run_pelagos(cfg, &a) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("pelagos-docker volume ls: {}", e);
-                return 1;
-            }
-        };
-        for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
-            if let Some(name) = line.split_whitespace().last() {
-                println!("{}", name);
-            }
-        }
-        return out.status.code().unwrap_or(0);
     }
     match run_pelagos_inherited(cfg, &a) {
         Ok(s) => s.code().unwrap_or(1),
@@ -1075,7 +1016,7 @@ fn cmd_cp(cfg: &Config, src: &str, dst: &str) -> i32 {
     }
 }
 
-fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>, quiet: bool) -> i32 {
+fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>) -> i32 {
     let mut a: Vec<OsString> = args(&["network", sub]);
     // `docker network create <name>` auto-assigns a subnet; pelagos requires one explicitly.
     // Pick 10.88.<hash>.0/24 derived from the name so repeated calls are idempotent.
@@ -1089,22 +1030,6 @@ fn cmd_network(cfg: &Config, sub: &str, name: Option<&str>, quiet: bool) -> i32 
         }
     } else if let Some(n) = name {
         a.push(n.into());
-    }
-    // -q/--quiet for `network ls`: capture output and print only the name column.
-    if quiet && sub == "ls" {
-        let out = match run_pelagos(cfg, &a) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("pelagos-docker network ls: {}", e);
-                return 1;
-            }
-        };
-        for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
-            if let Some(name) = line.split_whitespace().last() {
-                println!("{}", name);
-            }
-        }
-        return out.status.code().unwrap_or(0);
     }
     match run_pelagos_inherited(cfg, &a) {
         Ok(s) => s.code().unwrap_or(1),
