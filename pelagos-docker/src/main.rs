@@ -259,7 +259,7 @@ fn main() {
             entrypoint,
             rm: _,
             attach: _,
-            sig_proxy: _,
+            sig_proxy,
             image_and_args,
         } => cmd_run(
             &cfg,
@@ -273,6 +273,7 @@ fn main() {
                 label_args: labels,
                 entrypoint,
                 image_and_args,
+                sig_proxy,
             },
         ),
         DockerCmd::Exec {
@@ -383,6 +384,7 @@ struct RunOpts {
     label_args: Vec<String>,
     entrypoint: Option<String>,
     image_and_args: Vec<String>,
+    sig_proxy: Option<String>,
 }
 
 /// Parse `--mount type=bind,source=X,target=Y[,...]` into a `-v X:Y` string.
@@ -420,15 +422,40 @@ fn parse_mount_as_volume(mount_spec: &str) -> Option<String> {
 fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
     let RunOpts {
         name,
-        detach,
+        mut detach,
         volumes,
         mounts,
         env,
         ports,
         label_args,
         entrypoint,
-        image_and_args,
+        mut image_and_args,
+        sig_proxy,
     } = opts;
+
+    // Detect the devcontainer probe pattern:
+    //   docker run --sig-proxy=false ... /bin/sh -c "echo Container started"
+    // VS Code sends this to verify the container image is runnable. The container
+    // exits in milliseconds, after which VS Code calls `docker exec` — but by then
+    // the PID is dead and may be reused by an Alpine process, causing exec to enter
+    // the wrong namespace. We intercept this: run the container detached with a
+    // sleep keepalive appended, suppress pelagos's output, and synthesize the
+    // expected "Container started" line ourselves.
+    let is_probe = sig_proxy.as_deref() == Some("false")
+        && image_and_args
+            .iter()
+            .any(|a| a.contains("echo Container started"));
+    if is_probe {
+        // Append keepalive to the shell command so the container stays alive.
+        for a in &mut image_and_args {
+            if a.contains("echo Container started") {
+                *a = format!("{}; while sleep 1000; do :; done", a);
+                break;
+            }
+        }
+        detach = true;
+    }
+
     let (image, cmd_args) = match image_and_args.split_first() {
         Some((img, rest)) => (img.clone(), rest.to_vec()),
         None => {
@@ -493,6 +520,26 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
         sub.push(image.as_str().into());
         for a in &cmd_args {
             sub.push(a.into());
+        }
+    }
+
+    if is_probe {
+        // Capture output so we can suppress pelagos's "container name" stdout
+        // and instead emit the "Container started" line VS Code expects.
+        let out = match run_pelagos(cfg, &sub) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("pelagos-docker run: {}", e);
+                return 1;
+            }
+        };
+        if out.status.success() {
+            println!("Container started");
+            return 0;
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprint!("{}", stderr);
+            return out.status.code().unwrap_or(1);
         }
     }
 
@@ -925,7 +972,8 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
         }
     }
 
-    println!("{}", serde_json::to_string_pretty(&results).unwrap());
+    let json = serde_json::to_string_pretty(&results).unwrap();
+    println!("{}", json);
     if missing {
         1
     } else {

@@ -516,6 +516,7 @@ fn pull_image(writer: &mut impl Write, image: &str) -> std::io::Result<bool> {
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_container(
     writer: &mut impl Write,
     image: &str,
@@ -918,6 +919,21 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
             return Ok(());
         }
     };
+    let root_fd = match open_root_fd(pid) {
+        Ok(f) => f,
+        Err(e) => {
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
+            }
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: open root fd: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
 
     let src_path = Path::new(src);
     let parent = src_path
@@ -929,7 +945,7 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
 
     let mut cmd = Command::new("tar");
     cmd.arg("-cC").arg(parent).arg(name);
-    // Enter container namespaces in the child after fork, before exec.
+    // Enter container namespaces and anchor root dentry to container rootfs.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -938,15 +954,26 @@ fn handle_cp_from(writer: &mut impl Write, container: &str, src: &str) -> std::i
                 }
                 libc::close(ns_fd);
             }
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(root_fd);
             Ok(())
         });
     }
 
     let output = cmd.output();
-    // Close parent's copies of ns_fds.
+    // Close parent's copies of ns_fds and root_fd.
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     let output = match output {
         Ok(o) => o,
@@ -1017,13 +1044,28 @@ fn handle_cp_to(
             return Ok(());
         }
     };
+    let root_fd = match open_root_fd(pid) {
+        Ok(f) => f,
+        Err(e) => {
+            for &nfd in &ns_fds {
+                unsafe { libc::close(nfd) };
+            }
+            send_response(
+                writer,
+                &GuestResponse::Error {
+                    error: format!("cp: open root fd: {}", e),
+                },
+            )?;
+            return Ok(());
+        }
+    };
 
     let mut cmd = Command::new("tar");
     cmd.arg("-xC")
         .arg(dst)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped());
-    // Enter container namespaces in the child after fork, before exec.
+    // Enter container namespaces and anchor root dentry to container rootfs.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -1032,6 +1074,16 @@ fn handle_cp_to(
                 }
                 libc::close(ns_fd);
             }
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(root_fd);
             Ok(())
         });
     }
@@ -1042,6 +1094,7 @@ fn handle_cp_to(
             for &ns_fd in &ns_fds {
                 unsafe { libc::close(ns_fd) };
             }
+            unsafe { libc::close(root_fd) };
             send_response(
                 writer,
                 &GuestResponse::Error {
@@ -1051,10 +1104,11 @@ fn handle_cp_to(
             return Ok(());
         }
     };
-    // Close parent's copies of ns_fds.
+    // Close parent's copies of ns_fds and root_fd.
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     let mut tar_stdin = child.stdin.take().unwrap();
     let copy_result = {
@@ -1190,6 +1244,24 @@ fn handle_exec_into(
         e
     })?;
 
+    // Open /proc/<pid>/root so we can chroot into the container's rootfs after
+    // setns(CLONE_NEWNS). setns changes the mount namespace but does NOT update
+    // the calling process's root dentry — without fchdir+chroot the process
+    // would still resolve absolute paths through the guest (Alpine) root.
+    let root_fd = open_root_fd(pid).map_err(|e| {
+        for &nfd in &ns_fds {
+            unsafe { libc::close(nfd) };
+        }
+        let mut w = FdWriter(fd);
+        let _ = send_response(
+            &mut w,
+            &GuestResponse::Error {
+                error: format!("exec-into: open root fd: {}", e),
+            },
+        );
+        e
+    })?;
+
     // Send ready — both sides switch to framed binary protocol.
     {
         let mut w = FdWriter(fd);
@@ -1199,10 +1271,11 @@ fn handle_exec_into(
     let (prog, rest) = match args.split_first() {
         Some(p) => p,
         None => {
-            // Close ns fds before returning.
-            for fd in ns_fds {
-                unsafe { libc::close(fd) };
+            // Close ns fds and root_fd before returning.
+            for nfd in ns_fds {
+                unsafe { libc::close(nfd) };
             }
+            unsafe { libc::close(root_fd) };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "exec-into: no command",
@@ -1217,8 +1290,10 @@ fn handle_exec_into(
     }
 
     // Enter namespaces in the child after fork, before exec.
-    // Only async-signal-safe operations (setns, close) are used here.
+    // Only async-signal-safe operations (setns, close, fchdir, chroot) are used.
     // Order: net/uts/ipc first, pid before mnt (so /proc stays readable).
+    // After all setns calls, fchdir+chroot into the container's rootfs so that
+    // absolute paths resolve through the container filesystem, not the guest root.
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -1227,22 +1302,33 @@ fn handle_exec_into(
                 }
                 libc::close(ns_fd);
             }
+            // Anchor root dentry to the container rootfs.
+            if libc::fchdir(root_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(root_fd);
             Ok(())
         });
     }
 
-    // Spawn and run; parent closes its copies of ns_fds after spawn returns.
+    // Spawn and run; parent closes its copies of ns_fds and root_fd after spawn.
     let result = if tty {
         handle_exec_tty(fd, cmd)
     } else {
         handle_exec_piped(fd, cmd)
     };
 
-    // Close parent copies of ns_fds (child already closed its copies in pre_exec,
-    // but the parent's copies are duplicates inherited at fork time).
+    // Close parent copies (child already closed its copies in pre_exec).
     for &ns_fd in &ns_fds {
         unsafe { libc::close(ns_fd) };
     }
+    unsafe { libc::close(root_fd) };
 
     result
 }
@@ -1277,6 +1363,28 @@ unsafe fn call_setns(fd: libc::c_int) -> libc::c_int {
 #[cfg(not(target_os = "linux"))]
 unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
     panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// Open the container's root directory as an fd via `/proc/<pid>/root`.
+///
+/// `setns(CLONE_NEWNS)` changes the mount namespace but does NOT update the
+/// calling process's root dentry — absolute paths still resolve through the
+/// old (Alpine) root.  Opening this fd BEFORE fork and then doing
+/// `fchdir(root_fd); chroot(".")` AFTER all setns calls in pre_exec is the
+/// correct pattern for entering the container's rootfs (same approach as
+/// pelagos's own exec.rs / nsenter(1)).
+///
+/// Must be opened in the parent (before fork) while `/proc/<pid>/root` is
+/// still accessible.  No O_CLOEXEC: fd must survive into pre_exec.
+fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
+    let path = format!("/proc/{}/root", pid);
+    let cpath = std::ffi::CString::new(path.as_str())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 /// Open namespace file descriptors for the given PID.
