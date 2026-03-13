@@ -454,7 +454,39 @@ fn pelagos_bin() -> String {
 
 /// Pull the image, streaming stderr lines back via the provided writer.
 /// Returns Ok(true) on success, Ok(false) on failure (error response sent).
+/// Return true if the image is already present in the local pelagos image store.
+///
+/// pelagos stores images at `<data_dir>/images/<dirname>/manifest.json` where
+/// dirname is the reference with ':', '/', '@' replaced by '_'.  If that file
+/// exists the image is fully cached and no network pull is needed.
+fn image_cached_locally(image: &str) -> bool {
+    // Normalize the reference the same way pelagos does before storing:
+    // add ":latest" if no tag or digest, so the dirname matches what pelagos
+    // wrote (e.g. "public.ecr.aws/docker/library/alpine" →
+    // "public.ecr.aws_docker_library_alpine_latest").
+    let normalized = if !image.contains(':') && !image.contains('@') {
+        format!("{}:latest", image)
+    } else {
+        image.to_string()
+    };
+    let dirname: String = normalized
+        .chars()
+        .map(|c| if matches!(c, ':' | '/' | '@') { '_' } else { c })
+        .collect();
+    std::path::Path::new("/var/lib/pelagos/images")
+        .join(&dirname)
+        .join("manifest.json")
+        .exists()
+}
+
 fn pull_image(writer: &mut impl Write, image: &str) -> std::io::Result<bool> {
+    // Skip the registry round-trip entirely when the image is already cached.
+    // pelagos image pull always checks the remote manifest even for cached
+    // images, which burns through ECR unauthenticated rate limits quickly.
+    if image_cached_locally(image) {
+        return Ok(true);
+    }
+
     let pelagos = pelagos_bin();
 
     const PULL_ATTEMPTS: u32 = 10;

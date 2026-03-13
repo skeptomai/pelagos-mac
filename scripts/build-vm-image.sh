@@ -41,7 +41,7 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
-PELAGOS_VERSION="0.27.1"
+PELAGOS_VERSION="0.26.0"
 PELAGOS_BIN="$WORK/pelagos-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
 
@@ -452,6 +452,9 @@ busybox insmod /lib/modules/$KVER/kernel/drivers/char/hw_random/virtio-rng.ko 2>
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vsock.ko 2>/dev/null || true
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko 2>/dev/null || true
 busybox insmod /lib/modules/$KVER/kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko 2>/dev/null || true
+
+# Load overlay filesystem module (required by pelagos for container rootfs).
+busybox insmod /lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko 2>/dev/null || true
 
 # Load virtio-net modules (not built into the Alpine virt kernel).
 busybox insmod /lib/modules/$KVER/kernel/net/core/failover.ko 2>/dev/null || true
