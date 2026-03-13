@@ -1068,12 +1068,20 @@ fn cmd_inspect_container(cfg: &Config, names: &[String]) -> i32 {
             let binds: Vec<String> = all_specs.iter().map(|s| s.to_string()).collect();
 
             let ports = build_ports_map(name, &port_map);
+            // Extract started_at from pelagos inspect for lifecycle marker idempotency.
+            let started_at = native
+                .as_ref()
+                .and_then(|v| v.get("started_at")?.as_str())
+                .unwrap_or("")
+                .to_string();
             results.push(ContainerInspect {
                 id: entry.name.clone(),
                 name: format!("/{}", entry.name),
+                created: started_at.clone(),
                 state: ContainerState {
                     running: entry.status == "running",
                     status: entry.status.clone(),
+                    started_at,
                 },
                 config: ContainerConfig {
                     image: entry.image.clone(),

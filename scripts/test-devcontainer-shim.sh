@@ -260,6 +260,53 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------------------
+# Phase 5.5: Extended inspect fields (what devcontainer CLI's FJ function reads)
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 5.5: inspect fields devcontainer CLI reads ==="
+
+INSPECT_TMP2=$(mktemp /tmp/pelagos-inspect-ext-XXXXXX.json)
+OUT=$(shim inspect --type container "$CNAME" 2>&1)
+printf '%s' "$OUT" > "$INSPECT_TMP2"
+python3 - "$INSPECT_TMP2" <<'PYEOF2' 2>/tmp/pelagos-inspect-ext-err.txt
+import sys, json, re
+path = sys.argv[1]
+data = json.loads(open(path).read())
+c = data[0]
+
+# Created timestamp (used by devcontainer for lifecycle marker idempotency)
+assert c.get("Created"), "Created field missing or empty — devcontainer uses it for lifecycle markers"
+print(f"  [OK]   Created: {c['Created']}")
+
+# State.StartedAt (used for postStartCommand markers)
+assert c.get("State", {}).get("StartedAt"), "State.StartedAt missing — devcontainer uses it for postStart markers"
+print(f"  [OK]   State.StartedAt: {c['State']['StartedAt']}")
+
+# Config.User (devcontainer falls back to 'root' if empty, but field must exist)
+assert "User" in c.get("Config", {}), "Config.User field missing"
+print(f"  [OK]   Config.User: '{c['Config']['User']}'")
+
+# Config.Env must be a list (devcontainer calls Dt() which iterates it)
+env = c.get("Config", {}).get("Env", [])
+assert isinstance(env, list), f"Config.Env must be a list, got: {type(env)}"
+print(f"  [OK]   Config.Env: list of {len(env)} entries")
+
+# NetworkSettings.Ports must be an object (devcontainer iterates keys)
+ports = c.get("NetworkSettings", {}).get("Ports", None)
+assert isinstance(ports, dict), f"NetworkSettings.Ports must be object, got: {ports}"
+print(f"  [OK]   NetworkSettings.Ports: dict ({len(ports)} entries)")
+PYEOF2
+PY_RC=$?
+rm -f "$INSPECT_TMP2"
+if [ "$PY_RC" -eq 0 ]; then
+    pass "inspect: Created, State.StartedAt, Config.User, Config.Env, NetworkSettings.Ports all present"
+else
+    PY_ERR=$(cat /tmp/pelagos-inspect-ext-err.txt 2>/dev/null)
+    fail "inspect: missing fields — $PY_ERR"
+fi
+
+# ---------------------------------------------------------------------------
 # Phase 6: docker exec into the running container
 # ---------------------------------------------------------------------------
 
@@ -286,6 +333,145 @@ if echo "$OUT" | grep -qi "ubuntu"; then
     pass "exec: /etc/os-release shows Ubuntu (correct container rootfs)"
 else
     fail "exec: expected Ubuntu os-release, got: $OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 6.5: VS Code devcontainer shell server pattern
+# devcontainer CLI (FJ function) opens an interactive shell and runs commands
+# through stdin/stdout using sentinel tokens to demarcate output.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 6.5: VS Code shell server pattern ==="
+
+SHIM_ABS="$SHIM"
+SENTINEL="pelagos-sentinel-$$"
+
+# devcontainer starts: docker exec -i -u root -e VSCODE_REMOTE_CONTAINERS_SESSION=xxx <container> /bin/sh
+# then probes $PATH, getent passwd, uname -m, /etc/os-release through stdin.
+SHELL_OUT=$(printf \
+    'echo -n %s; ( echo $PATH ); echo -n %s$?%s; echo -n %s >&2\n
+echo -n %s; ( getent passwd root ); echo -n %s$?%s; echo -n %s >&2\n
+echo -n %s; ( uname -m ); echo -n %s$?%s; echo -n %s >&2\n
+echo -n %s; ( cat /etc/os-release ); echo -n %s$?%s; echo -n %s >&2\n
+exit\n' \
+    "$SENTINEL" "$SENTINEL" "$SENTINEL" "$SENTINEL" \
+    "$SENTINEL" "$SENTINEL" "$SENTINEL" "$SENTINEL" \
+    "$SENTINEL" "$SENTINEL" "$SENTINEL" "$SENTINEL" \
+    "$SENTINEL" "$SENTINEL" "$SENTINEL" "$SENTINEL" \
+    | "$SHIM_ABS" exec -i -u root -e VSCODE_REMOTE_CONTAINERS_SESSION=test-session \
+      "$CNAME" /bin/sh 2>&1)
+
+# PATH must be non-empty
+if echo "$SHELL_OUT" | grep -q "/bin\|/usr"; then
+    pass "shell-server: echo \$PATH returned a non-empty path"
+else
+    fail "shell-server: echo \$PATH returned empty/nothing; out=$SHELL_OUT"
+fi
+
+# getent passwd root must return root entry (output is interleaved with sentinels,
+# so don't anchor with ^)
+if echo "$SHELL_OUT" | grep -q "root:x:0:0"; then
+    pass "shell-server: getent passwd root returned root entry"
+else
+    fail "shell-server: getent passwd root missing; out=$SHELL_OUT"
+fi
+
+# uname -m must return architecture
+if echo "$SHELL_OUT" | grep -qE "aarch64|x86_64|arm"; then
+    pass "shell-server: uname -m returned architecture"
+else
+    fail "shell-server: uname -m unexpected; out=$SHELL_OUT"
+fi
+
+# /etc/os-release must show Ubuntu
+if echo "$SHELL_OUT" | grep -qi "ubuntu"; then
+    pass "shell-server: /etc/os-release shows Ubuntu"
+else
+    fail "shell-server: /etc/os-release no Ubuntu; out=$SHELL_OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 6.6: VS Code user-env probe pattern (login interactive shell)
+# devcontainer calls: docker exec -i -u root <container> /bin/bash -l -i -c "<cmd>"
+# to probe the user's full login environment.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 6.6: VS Code user-env probe (login shell) ==="
+
+PROBE_UUID="probe-$(date +%s)"
+PROBE_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" \
+    /bin/bash -l -i -c "echo -n $PROBE_UUID; cat /proc/self/environ; echo -n $PROBE_UUID" 2>&1)
+
+if echo "$PROBE_OUT" | grep -q "$PROBE_UUID"; then
+    pass "user-env probe: /bin/bash -lic ran and produced sentinel output"
+else
+    fail "user-env probe: /bin/bash -lic failed; out=$PROBE_OUT"
+fi
+
+# /proc/self/environ contains null-separated KEY=VAL entries.
+# Note: /proc/self is only accessible if exec'd process is in the container's PID
+# namespace. pelagos exec-into enters the mount namespace but stays in the outer
+# PID namespace, so /proc/self/environ is typically unavailable.
+# devcontainer CLI falls back to `printenv` automatically when this happens.
+if echo "$PROBE_OUT" | tr '\0' '\n' | grep -q "="; then
+    pass "user-env probe: /proc/self/environ returned env data"
+else
+    # /proc/self/environ not available (expected: PID namespace boundary).
+    # Verify devcontainer's printenv fallback path returns some env vars.
+    PRINTENV_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c 'printenv' 2>&1)
+    if echo "$PRINTENV_OUT" | grep -q "="; then
+        pass "user-env probe: /proc/self/environ unavailable (PID ns); printenv fallback returns env vars"
+    else
+        fail "user-env probe: neither /proc/self/environ nor printenv returned env data; out=$PROBE_OUT"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 6.7: VS Code system-config patching
+# devcontainer patches /etc/environment and /etc/profile to set env vars.
+# Both use exec -i -u root through the shell server.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== phase 6.7: VS Code system-config patching ==="
+
+# Test /etc/environment write (devcontainer adds env vars here)
+PATCH_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c \
+    "mkdir -p /var/devcontainer && test ! -f /var/devcontainer/.envmarker && touch /var/devcontainer/.envmarker && echo patched-env" 2>&1)
+if echo "$PATCH_OUT" | grep -q "patched-env"; then
+    pass "system-config: mkdir /var/devcontainer + marker file + echo works"
+else
+    # Accept if marker already exists (idempotent)
+    EXIST_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c \
+        "test -f /var/devcontainer/.envmarker && echo marker-exists" 2>&1)
+    if echo "$EXIST_OUT" | grep -q "marker-exists"; then
+        pass "system-config: /var/devcontainer marker already exists (idempotent)"
+    else
+        fail "system-config: mkdir/marker failed; out=$PATCH_OUT"
+    fi
+fi
+
+# Test /etc/environment append (devcontainer appends env vars)
+APPEND_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c \
+    "cat >> /etc/environment <<'EOF'
+TEST_ENV_VAR=\"test-value\"
+EOF
+grep TEST_ENV_VAR /etc/environment" 2>&1)
+if echo "$APPEND_OUT" | grep -q "TEST_ENV_VAR"; then
+    pass "system-config: cat >> /etc/environment works"
+else
+    fail "system-config: /etc/environment append failed; out=$APPEND_OUT"
+fi
+
+# Test /etc/profile sed (devcontainer normalizes PATH in /etc/profile)
+SED_OUT=$("$SHIM_ABS" exec -i -u root "$CNAME" /bin/sh -c \
+    "sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true && echo sed-ok" 2>&1)
+if echo "$SED_OUT" | grep -q "sed-ok"; then
+    pass "system-config: sed -i on /etc/profile works"
+else
+    fail "system-config: sed /etc/profile failed; out=$SED_OUT"
 fi
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,8 @@ use serde::Serialize;
 pub struct ContainerInspect {
     pub id: String,
     pub name: String,
+    /// ISO-8601 creation timestamp. Used by devcontainer CLI for lifecycle command markers.
+    pub created: String,
     pub state: ContainerState,
     pub config: ContainerConfig,
     pub host_config: HostConfig,
@@ -50,6 +52,9 @@ pub struct MountEntry {
 pub struct ContainerState {
     pub status: String,
     pub running: bool,
+    /// ISO-8601 timestamp when the container process started.
+    /// Used by devcontainer CLI for lifecycle command idempotency markers.
+    pub started_at: String,
 }
 
 #[derive(Serialize)]
