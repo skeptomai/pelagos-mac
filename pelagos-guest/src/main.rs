@@ -1334,6 +1334,10 @@ fn handle_exec_into(
 }
 
 /// Parse `pelagos ps --all` output and return the PID of the named container.
+///
+/// The PID column can be `-` when the container was created but the process has
+/// not yet started (or failed to start).  Treat `-` as "not running" rather
+/// than returning a parse error.
 fn get_container_pid(container: &str) -> std::io::Result<u32> {
     let out = Command::new(pelagos_bin()).args(["ps", "--all"]).output()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1341,7 +1345,17 @@ fn get_container_pid(container: &str) -> std::io::Result<u32> {
     for line in stdout.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() >= 3 && cols[0] == container {
-            return cols[2]
+            let pid_str = cols[2];
+            if pid_str == "-" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "container '{}' has no running process (PID is '-')",
+                        container
+                    ),
+                ));
+            }
+            return pid_str
                 .parse::<u32>()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
         }
