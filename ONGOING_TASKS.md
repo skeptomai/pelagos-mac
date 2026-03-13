@@ -84,16 +84,17 @@ from `run_container()` in `pelagos-guest/src/main.rs` and close pelagos-mac issu
 
 - **`docker volume inspect`** — `create/ls/rm` works; `inspect` not implemented.
   Bind mounts cover most real use cases so this is low priority.
-- **VS Code extension end-to-end test** — BLOCKED on pelagos runtime fixes.
-  The devcontainer probe runs successfully (`docker run --sig-proxy=false ...`
-  → "Container started"), but VS Code immediately calls `docker exec` into the
-  container before `docker start` is called. pelagos destroys the container on
-  exit, so exec-into fails. Two upstream issues must be fixed first:
-  - **pelagos#90**: container exited-state persistence (don't destroy on exit)
-  - **pelagos#91**: exec into stopped container without a live PID
-  Client-side workarounds were attempted (sidecar state cache, keepalive
-  processes) but are not viable — the blocking/race conditions are fundamental.
-  Resume this after pelagos#90 and #91 land.
+- **VS Code extension end-to-end test** — BLOCKED on pelagos runtime fix.
+  The shim layer (docker version/ps/run/inspect/label filtering) all work.
+  `docker exec` into a running container lands in the wrong filesystem because
+  pelagos uses `chroot` instead of `pivot_root` for container rootfs isolation.
+  After `setns(mnt_fd)`, `/` is still the guest Alpine root — the container's
+  actual rootfs is only reachable via the `chroot` pelagos called at startup.
+  A workaround (`fchdir(/proc/<pid>/root)` + `chroot(".")` after `setns`) exists
+  in branch `fix/exec-into-chroot` (PR #85, closed), but the correct fix is
+  upstream. **Resume after pelagos#95 lands** (switch `with_chroot` → `with_pivot_root`
+  in `src/cli/run.rs`). Once pelagos uses `pivot_root`, `setns(mnt)` gives the
+  correct container rootfs directly and PR #85 can be reopened/superseded.
 - **Signed installer** — `.pkg` for distribution. Requires Developer ID + notarization
   + `com.apple.security.virtualization` entitlement. Not yet scoped.
 
