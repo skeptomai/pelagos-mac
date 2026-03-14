@@ -170,8 +170,9 @@ while kill -0 "$PING_PID" 2>/dev/null; do
     if [ -z "$CONSOLE_PID" ] && [ -S "$CONSOLE_SOCK" ]; then
         # console.sock is live — stream hvc0 to stdout.
         # stdin=/dev/null so pelagos vm console doesn't enter raw mode.
-        pelagos --kernel "$KERNEL" --initrd "$INITRD" --disk "$DISK" \
-                --cmdline "console=hvc0" vm console </dev/null 2>/dev/null &
+        # Use $BINARY directly (the pelagos() shell function adds VM flags already).
+        "$BINARY" --kernel "$KERNEL" --initrd "$INITRD" --disk "$DISK" \
+                  --cmdline "console=hvc0" vm console </dev/null 2>/dev/null &
         CONSOLE_PID=$!
     fi
     sleep 0.5
