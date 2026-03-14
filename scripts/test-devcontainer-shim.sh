@@ -182,10 +182,13 @@ while kill -0 "$PING_PID" 2>/dev/null; do
                   --cmdline "console=hvc0" vm console </dev/null >>"$CONSOLE_LOG" 2>/dev/null &
         CONSOLE_PID=$!
     fi
+    ELAPSED=$(( TICKS / 2 ))
+    printf "\r  Waiting for pong... %ds  (console → %s)" "$ELAPSED" "$CONSOLE_LOG"
     sleep 0.5
     TICKS=$((TICKS + 1))
     [ "$TICKS" -gt 140 ] && break  # 70s hard timeout
 done
+printf "\r%60s\r" ""  # clear the progress line
 
 # SIGKILL: vm console blocks in read() and ignores SIGTERM.
 [ -n "$CONSOLE_PID" ] && kill -9 "$CONSOLE_PID" 2>/dev/null || true
