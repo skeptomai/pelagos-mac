@@ -1,0 +1,7 @@
+{
+  "name": "pelagos-test-prebuilt",
+  "image": "public.ecr.aws/docker/library/ubuntu:22.04",
+  "containerEnv": {
+    "PELAGOS_TEST": "prebuilt"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "pelagos-test-dockerfile",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "containerEnv": {
+    "PELAGOS_TEST": "dockerfile"
+  }
+}
