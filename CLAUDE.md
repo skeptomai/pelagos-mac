@@ -25,6 +25,33 @@ pelagos-mac/      macOS CLI binary: boots VM via pelagos-vz, proxies commands ov
 
 ## ⚠️ CRITICAL DESIGN DECISIONS — READ BEFORE WRITING CODE ⚠️
 
+### No Shim Workarounds for pelagos Bugs
+
+**The `pelagos-docker` shim is a Docker CLI compatibility layer, not a bug-fix
+layer for pelagos.**
+
+When a pelagos capability is missing or broken, the correct response is:
+
+1. File a GitHub issue at `https://github.com/skeptomai/pelagos` with a clear
+   reproduction case.
+2. Fix the bug in pelagos (the right place) — not in the shim.
+3. Update `ONGOING_TASKS.md` to note the pelagos issue number blocking further
+   progress.
+
+**Never add workarounds to the shim** to compensate for pelagos behaviour that
+should be fixed in pelagos itself. Shim workarounds:
+- Mask the real bug from the pelagos maintainer
+- Accumulate as technical debt in the shim
+- Break when pelagos fixes the underlying bug
+
+Legitimate shim responsibilities:
+- Translating Docker CLI flags/subcommands to pelagos equivalents
+- Accepting (and ignoring with a comment) Docker flags that pelagos does not
+  yet support (e.g., `--platform`, `--target`)
+- Docker API format translation (e.g., JSON output shape differences)
+
+---
+
 ### No Subsystem Dependencies
 
 **pelagos-mac has no subsystem-sized external dependencies.**

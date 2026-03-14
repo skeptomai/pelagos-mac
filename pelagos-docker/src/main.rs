@@ -1477,21 +1477,16 @@ fn cmd_build(
     // --target is accepted but not forwarded: pelagos build does not yet support
     // multi-stage target selection. The devcontainer CLI always makes
     // dev_containers_target_stage the final stage, so omitting --target produces
-    // the same image. Re-wire once pelagos build gains --target support.
+    // the same image. Track as pelagos issue #TBD.
     let _ = target;
     sub.push(context.into());
-    let rc = match run_pelagos_inherited(cfg, &sub) {
+    match run_pelagos_inherited(cfg, &sub) {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("pelagos-docker build: {}", e);
             1
         }
-    };
-    // Clean up temp file regardless of exit code.
-    if let Some(ref p) = resolved {
-        let _ = std::fs::remove_file(p);
     }
-    rc
 }
 
 fn cmd_volume(cfg: &Config, sub: &str, name: Option<&str>, quiet: bool) -> i32 {

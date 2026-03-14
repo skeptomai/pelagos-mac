@@ -71,7 +71,6 @@ All Suite C tests now pass (node v24.14.0, npm 11.9.0) with pelagos v0.53.0
 (fixes exec-into ENV/PATH, issue #115) and the host-clock-sync fix
 (VM clock injected via `clock.utc=` in kernel cmdline, no NTP on startup path).
 
-
 ### VS Code full extension integration test (#91)
 
 Run VS Code "Reopen in Container" against a project with a `.devcontainer/`
