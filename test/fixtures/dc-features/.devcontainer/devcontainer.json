@@ -1,0 +1,12 @@
+{
+  "name": "pelagos-test-features",
+  "image": "public.ecr.aws/docker/library/ubuntu:22.04",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "lts"
+    }
+  },
+  "containerEnv": {
+    "PELAGOS_TEST": "features"
+  }
+}

@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-14*
+*Last updated: 2026-03-14 (evening)*
 
 ---
 
@@ -52,23 +52,27 @@ remain (issues #91, #92).
 | docker build (native via pelagos) | #68 | ✅ PR #70 |
 | docker cp | #69 | ✅ PR #71 |
 | overlayfs / linux-lts kernel | #89 | ✅ PR #90 |
-| docker build multi-stage + features test | #92 | 🔲 |
+| docker build multi-stage + features test | #92 | 🔶 blocked on pelagos#102 |
 | VS Code full extension integration test | #91 | 🔲 |
 
 ---
 
 ## Remaining Work
 
-### devcontainer features / multi-stage build (#92) — next priority
+### devcontainer features / multi-stage build (#92) — blocked on pelagos#102
 
-`pelagos-docker build` already delegates to `pelagos build` natively inside the VM.
-`pelagos build` supports multi-stage Dockerfiles (`FROM … AS <stage>`,
-`COPY --from=<stage>`). What remains is end-to-end testing with a real
-devcontainer that uses `features:` or `build.dockerfile:`.
+T2 integration harness (`scripts/test-devcontainer-e2e.sh`) is built and running.
+Suites A and D pass. Suites B and C are blocked on pelagos#102:
 
-**Next step:** Test `devcontainer up` against a project that uses
-`"features": {"ghcr.io/devcontainers/features/node:1": {}}` with
-`pelagos-docker` as the Docker backend.
+**pelagos#102** — DNS fails inside `pelagos build` RUN steps. `apt-get update`
+(and any package manager) times out resolving hostnames. Root cause: pasta
+networking does not forward DNS for `127.0.0.53` (systemd-resolved stub address
+used by Ubuntu 22.04 base image). Fix must land in pelagos before Suites B and C
+can pass.
+
+**Once pelagos#102 is fixed:**
+- Run `bash scripts/test-devcontainer-e2e.sh --suite B` (custom Dockerfile + apt-get)
+- Run `bash scripts/test-devcontainer-e2e.sh --suite C` (node feature via apt-get)
 
 ### VS Code full extension integration test (#91)
 
