@@ -233,6 +233,14 @@ enum DockerCmd {
         /// Destination: `container:path` or local path.
         dst: String,
     },
+    /// Manage Docker contexts (stub — always returns a single default context).
+    Context {
+        /// Subcommand: ls, inspect, use, create, rm, show, update, export, import.
+        sub: String,
+        /// Optional arguments (context name, flags, etc.).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +351,7 @@ fn main() {
         DockerCmd::Volume { sub, name, quiet } => cmd_volume(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Network { sub, name, quiet } => cmd_network(&cfg, &sub, name.as_deref(), quiet),
         DockerCmd::Cp { src, dst } => cmd_cp(&cfg, &src, &dst),
+        DockerCmd::Context { sub, args: _ } => cmd_context(&sub),
     };
 
     process::exit(exit_code);
@@ -1431,6 +1440,37 @@ fn cmd_cp(cfg: &Config, src: &str, dst: &str) -> i32 {
             eprintln!("pelagos-docker cp: {}", e);
             1
         }
+    }
+}
+
+/// `docker context` — devcontainer pre-flight check.
+///
+/// devcontainer CLI calls `docker context ls --format {{json .}}` to find which
+/// context to use.  We always have exactly one context (the pelagos VM), so
+/// return a single-entry list describing it.  All other subcommands are no-ops.
+fn cmd_context(sub: &str) -> i32 {
+    match sub {
+        "ls" => {
+            // One JSON object per line, matching Docker's --format {{json .}} output.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "Current": true,
+                    "Description": "pelagos VM",
+                    "DockerEndpoint": "",
+                    "Error": "",
+                    "Name": "default",
+                    "StackOrchestrator": ""
+                })
+            );
+            0
+        }
+        "show" => {
+            println!("default");
+            0
+        }
+        // inspect / use / create / rm / update / export / import — accept silently.
+        _ => 0,
     }
 }
 
