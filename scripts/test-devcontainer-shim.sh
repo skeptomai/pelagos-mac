@@ -97,6 +97,22 @@ else
     fail "docker -v: unexpected output: $OUT"
 fi
 
+# docker context ls --format {{json .}} → devcontainer pre-flight check
+OUT=$(shim context ls --format '{{json .}}' 2>&1)
+if echo "$OUT" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); assert d.get('Name')=='default'" 2>/dev/null; then
+    pass "context ls: returned default context JSON"
+else
+    fail "context ls: unexpected output: $OUT"
+fi
+
+# docker context show → current context name
+OUT=$(shim context show 2>&1)
+if [ "$OUT" = "default" ]; then
+    pass "context show: 'default'"
+else
+    fail "context show: expected 'default', got: $OUT"
+fi
+
 # docker buildx version → must exit non-zero (VS Code tolerates this)
 shim buildx version >/dev/null 2>&1
 RC=$?
