@@ -858,21 +858,41 @@ fn handle_build(
         }
     }
 
-    // Pre-pull the base image declared in the first FROM line.
+    // Pre-pull all distinct registry base images declared in FROM lines.
+    //
+    // Multi-stage builds have multiple FROM lines. Each stage either names a
+    // registry image (must be pulled) or references an earlier stage by alias
+    // (already in the local store — no pull needed).  We track stage aliases as
+    // we scan so we can skip them.
     let dockerfile_path = format!("{}/{}", ctx_dir, dockerfile);
     if let Ok(content) = std::fs::read_to_string(&dockerfile_path) {
+        let mut stage_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pulled: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in content.lines() {
-            if line.trim().to_ascii_uppercase().starts_with("FROM") {
-                let base = line.split_whitespace().nth(1).unwrap_or("").to_string();
-                if !base.is_empty()
-                    && !base.eq_ignore_ascii_case("scratch")
-                    && !pull_image(writer, &base)?
-                {
-                    let _ = std::fs::remove_dir_all(&ctx_dir);
-                    return Ok(());
-                }
-                break;
+            let trimmed = line.trim();
+            if !trimmed.to_ascii_uppercase().starts_with("FROM") {
+                continue;
             }
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let base = parts.get(1).copied().unwrap_or("").to_string();
+            // Record "FROM <image> AS <alias>" aliases so subsequent stages that
+            // reference them are not mistaken for registry images.
+            if parts.len() >= 4 && parts[2].to_ascii_uppercase() == "AS" {
+                stage_aliases.insert(parts[3].to_ascii_lowercase());
+            }
+            // Skip scratch, already-pulled images, and stage alias references.
+            if base.is_empty()
+                || base.eq_ignore_ascii_case("scratch")
+                || pulled.contains(&base.to_ascii_lowercase())
+                || stage_aliases.contains(&base.to_ascii_lowercase())
+            {
+                continue;
+            }
+            if !pull_image(writer, &base)? {
+                let _ = std::fs::remove_dir_all(&ctx_dir);
+                return Ok(());
+            }
+            pulled.insert(base.to_ascii_lowercase());
         }
     }
 
