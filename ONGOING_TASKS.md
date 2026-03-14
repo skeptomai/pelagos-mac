@@ -1,14 +1,16 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-13, SHA (chore/nat-diagnostics branch)*
+*Last updated: 2026-03-14*
 
 ---
 
 ## Current State
 
-**Phase 4 (VS Code devcontainer support) COMPLETE.** All 36 e2e tests pass
-(`bash scripts/test-e2e.sh`). The Docker CLI shim covers the full devcontainer
-lifecycle including `docker build`, `docker cp`, volumes, and networks.
+**Phase 4 (VS Code devcontainer support) largely complete.** The Docker CLI shim
+covers the full devcontainer lifecycle including `docker build` (native via
+`pelagos build` — no Docker Desktop or buildah), `docker cp`, volumes, and
+networks. Multi-stage build support and end-to-end devcontainer features testing
+remain (issues #91, #92).
 
 ### What works today
 
@@ -38,9 +40,7 @@ lifecycle including `docker build`, `docker cp`, volumes, and networks.
 
 ---
 
-## Phase 4 — VS Code Dev Container support (Epic #67) ✅ COMPLETE
-
-All sub-issues resolved:
+## Phase 4 — VS Code Dev Container support (Epic #67)
 
 | Subtask | Issue | Status |
 |---|---|---|
@@ -49,33 +49,38 @@ All sub-issues resolved:
 | glibc/Ubuntu compat | #58 | ✅ PR #61 |
 | docker exec, version, info, inspect | #64 | ✅ PR #65 |
 | devcontainer up smoke test | #66 | ✅ PR #66 |
-| docker build, volume, network | #68 | ✅ PR #70 |
+| docker build (native via pelagos) | #68 | ✅ PR #70 |
 | docker cp | #69 | ✅ PR #71 |
-
----
+| overlayfs / linux-lts kernel | #89 | ✅ PR #90 |
+| docker build multi-stage + features test | #92 | 🔲 |
+| VS Code full extension integration test | #91 | 🔲 |
 
 ---
 
 ## Remaining Work
 
-### VS Code devcontainer — ready to re-test
+### devcontainer features / multi-stage build (#92) — next priority
 
-pelagos v0.27.1 (epic #96) replaced `chroot` with `pivot_root` as the default
-root isolation mechanism. After `setns(mnt_fd)`, the mount namespace root is now
-the container's rootfs directly (old root detached via `MNT_DETACH`). The guest
-daemon's `handle_exec_into` (setns-only, no extra chroot step) now correctly lands
-inside the container filesystem.
+`pelagos-docker build` already delegates to `pelagos build` natively inside the VM.
+`pelagos build` supports multi-stage Dockerfiles (`FROM … AS <stage>`,
+`COPY --from=<stage>`). What remains is end-to-end testing with a real
+devcontainer that uses `features:` or `build.dockerfile:`.
 
-The blocker that closed PR #85 is gone. The `fix/exec-into-chroot` branch and
-its workaround are superseded — the current unmodified master code is correct.
+**Next step:** Test `devcontainer up` against a project that uses
+`"features": {"ghcr.io/devcontainers/features/node:1": {}}` with
+`pelagos-docker` as the Docker backend.
 
-**Next step:** Run VS Code "Reopen in Container" against `devcontainer-test` and
-trace any remaining failures in the exec/lifecycle flow.
+### VS Code full extension integration test (#91)
+
+Run VS Code "Reopen in Container" against a project with a `.devcontainer/`
+and verify: IDE attaches, extensions install, terminal opens inside container.
 
 ### pelagos-mac — Lower priority
 
 - **`docker volume inspect`** — `create/ls/rm` works; `inspect` not implemented.
   Bind mounts cover most real use cases so this is low priority.
+- **Dynamic virtiofs shares** (#74) — current per-path shares require knowing all
+  paths at VM start time; proper dynamic sharing needed for general-purpose use.
 - **Signed installer** — `.pkg` for distribution. Requires Developer ID + notarization
   + `com.apple.security.virtualization` entitlement. Not yet scoped.
 
@@ -89,8 +94,9 @@ trace any remaining failures in the exec/lifecycle flow.
   `setns(2)` via `pre_exec`. See `docs/GUEST_CONTAINER_EXEC.md`.
 - **VM networking:** socket_vmnet, subnet `192.168.105.x`, gateway `192.168.105.1`.
   Homebrew socket path: `/opt/homebrew/var/run/socket_vmnet` (no `.shared` suffix).
-- **`pelagos build` requires `--network none`** in the VM (no bridge/veth kernel
-  modules). Build steps that need network access require a kernel extension.
+- **`pelagos build` uses `--network pasta`** inside the VM. `pasta` (userspace
+  TCP/UDP proxy) is staged into the initramfs. Bridge/veth kernel modules are not
+  required. RUN steps that need network access work via pasta.
 - **`pelagos network create` requires `--subnet <CIDR>`** explicitly; the shim
   auto-generates `10.88.<hash>.0/24` from the network name.
 - **Network names max 12 chars** — bridge device name is `rm-<name>`, IFNAMSIZ=15.
