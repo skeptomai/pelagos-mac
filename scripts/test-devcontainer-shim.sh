@@ -151,23 +151,44 @@ for f in "$KERNEL" "$INITRD" "$DISK" "$BINARY" "$SHIM"; do
 done
 [ "$MISSING" -eq 1 ] && echo "Build and sign first. See ONGOING_TASKS.md Build Reference." && exit 1
 
-# Wait for the VM to respond.
-# pelagos ping calls ensure_running() which boots the VM if needed (up to 60s).
-# Run it in the background and print dots so the user knows it's working.
+# Boot the VM and stream its hvc0 console while waiting.
+# pelagos ping calls ensure_running() which spawns the daemon and boots the VM.
+# We run it in the background, then as soon as console.sock appears we attach
+# `pelagos vm console` so the full kernel+init output is visible in real time.
+CONSOLE_SOCK="$HOME/.local/share/pelagos/console.sock"
 PING_TMP=$(mktemp /tmp/pelagos-ping-XXXXXX)
+
+echo "  Booting VM — streaming hvc0 console:"
+echo "  --------------------------------------------------------"
+
 pelagos ping >"$PING_TMP" 2>&1 &
 PING_PID=$!
-printf "  Waiting for VM (first boot ~20s)"
+
+CONSOLE_PID=""
+TICKS=0
 while kill -0 "$PING_PID" 2>/dev/null; do
-    printf "."
-    sleep 1
+    if [ -z "$CONSOLE_PID" ] && [ -S "$CONSOLE_SOCK" ]; then
+        # console.sock is live — stream hvc0 to stdout.
+        # stdin=/dev/null so pelagos vm console doesn't enter raw mode.
+        pelagos --kernel "$KERNEL" --initrd "$INITRD" --disk "$DISK" \
+                --cmdline "console=hvc0" vm console </dev/null 2>/dev/null &
+        CONSOLE_PID=$!
+    fi
+    sleep 0.5
+    TICKS=$((TICKS + 1))
+    [ "$TICKS" -gt 140 ] && break  # 70s hard timeout
 done
-printf "\n"
+
+[ -n "$CONSOLE_PID" ] && kill "$CONSOLE_PID" 2>/dev/null; wait "$CONSOLE_PID" 2>/dev/null || true
+echo ""
+echo "  --------------------------------------------------------"
+
 wait "$PING_PID"; PING_RC=$?
 if [ "$PING_RC" -eq 0 ] && grep -q pong "$PING_TMP" 2>/dev/null; then
-    echo "  [OK]   VM responding"
+    echo "  [OK]   VM ready"
 else
-    echo "  [FAIL] VM did not respond (exit $PING_RC). Output: $(cat "$PING_TMP")"
+    echo "  [FAIL] VM did not respond (exit $PING_RC)."
+    echo "         ping output: $(cat "$PING_TMP")"
     echo "         Check: sudo brew services list | grep socket_vmnet"
     rm -f "$PING_TMP"
     exit 1
