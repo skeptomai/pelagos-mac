@@ -10,7 +10,7 @@
 #   4. Extract vsock/virtio modules from the modloop squashfs.
 #   5. Overlay our custom init + binaries on top of Alpine's initramfs.
 #   6. Repack as a single gzip'd cpio archive.
-#   7. Create a 512 MiB placeholder raw disk image (AVF requires a block device).
+#   7. Create an 8192 MiB placeholder raw disk image (AVF requires a block device).
 #
 # Kernel flavor detection: if the kernel flavor (lts vs virt) has changed since
 # the last build, stale kernel + initramfs artifacts are deleted automatically
@@ -23,7 +23,7 @@
 # Output (all idempotent — re-running skips completed steps):
 #   out/vmlinuz               — Alpine aarch64 LTS kernel (raw arm64 Image)
 #   out/initramfs-custom.gz   — Alpine initramfs + pelagos additions
-#   out/root.img              — 512 MiB placeholder disk
+#   out/root.img              — 8192 MiB placeholder disk
 #
 # Kernel cmdline to use:  console=hvc0
 # (the kernel's default rdinit=/init picks up our /init from the initramfs)
@@ -49,9 +49,11 @@ DISK_IMG="$OUT/root.img"
 INITRAMFS_OUT="$OUT/initramfs-custom.gz"
 KERNEL_OUT="$OUT/vmlinuz"
 
-PELAGOS_VERSION="0.29.0"
+PELAGOS_VERSION="0.51.0"
 PELAGOS_BIN="$WORK/pelagos-${PELAGOS_VERSION}-aarch64-linux"
 PELAGOS_URL="https://github.com/skeptomai/pelagos/releases/download/v${PELAGOS_VERSION}/pelagos-aarch64-linux"
+# If a local build exists (from /Users/cb/Projects/pelagos), use it instead of downloading.
+PELAGOS_LOCAL_BUILD="/Users/cb/Projects/pelagos/target/aarch64-unknown-linux-musl/release/pelagos"
 
 PASST_PKG="passt-2025.01.21-r0"
 PASST_APK="$WORK/${PASST_PKG}.apk"
@@ -74,6 +76,19 @@ SKALIBS_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALP
 ZLIB_PKG="zlib-1.3.1-r2"
 ZLIB_APK="$WORK/${ZLIB_PKG}.apk"
 ZLIB_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${ZLIB_PKG}.apk"
+
+# e2fsprogs: mke2fs binary + companion libraries for formatting /dev/vda on first boot.
+E2FSPROGS_PKG="e2fsprogs-1.47.1-r1"
+E2FSPROGS_APK="$WORK/${E2FSPROGS_PKG}.apk"
+E2FSPROGS_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${E2FSPROGS_PKG}.apk"
+E2FSPROGS_BIN="$WORK/mke2fs-bin"
+E2FSPROGS_LIBS_PKG="e2fsprogs-libs-1.47.1-r1"
+E2FSPROGS_LIBS_APK="$WORK/${E2FSPROGS_LIBS_PKG}.apk"
+E2FSPROGS_LIBS_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${E2FSPROGS_LIBS_PKG}.apk"
+LIBCOM_ERR_PKG="libcom_err-1.47.1-r1"
+LIBCOM_ERR_APK="$WORK/${LIBCOM_ERR_PKG}.apk"
+LIBCOM_ERR_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${ALPINE_ARCH}/${LIBCOM_ERR_PKG}.apk"
+
 
 # SSH key for 'pelagos vm ssh': generated once per user, baked into the initramfs.
 PELAGOS_STATE_DIR="$HOME/.local/share/pelagos"
@@ -203,7 +218,11 @@ fi
 # ---------------------------------------------------------------------------
 echo "[5/8] Downloading pelagos runtime binary (v${PELAGOS_VERSION})"
 # ---------------------------------------------------------------------------
-if [ ! -f "$PELAGOS_BIN" ]; then
+if [ -f "$PELAGOS_LOCAL_BUILD" ]; then
+    cp "$PELAGOS_LOCAL_BUILD" "$PELAGOS_BIN"
+    chmod 755 "$PELAGOS_BIN"
+    echo "  Using local build: $PELAGOS_LOCAL_BUILD"
+elif [ ! -f "$PELAGOS_BIN" ]; then
     curl -L --progress-bar -o "$PELAGOS_BIN" "$PELAGOS_URL"
     chmod 755 "$PELAGOS_BIN"
     echo "  Downloaded: $PELAGOS_BIN"
@@ -305,6 +324,39 @@ if [ ! -f "$PASTA_BIN" ]; then
     fi
 else
     echo "  (cached: $PASTA_BIN)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "[5e/8] Downloading e2fsprogs (mke2fs for formatting /dev/vda on first boot)"
+# ---------------------------------------------------------------------------
+if [ ! -f "$E2FSPROGS_BIN" ]; then
+    [ ! -f "$E2FSPROGS_APK" ] && curl -L --progress-bar -o "$E2FSPROGS_APK" "$E2FSPROGS_URL"
+    E2FS_EXTRACT="$WORK/e2fsprogs-extract"
+    rm -rf "$E2FS_EXTRACT" && mkdir -p "$E2FS_EXTRACT"
+    bsdtar -xf "$E2FSPROGS_APK" -C "$E2FS_EXTRACT" 2>/dev/null || true
+    if [ -f "$E2FS_EXTRACT/sbin/mke2fs" ]; then
+        cp "$E2FS_EXTRACT/sbin/mke2fs" "$E2FSPROGS_BIN"
+        chmod 755 "$E2FSPROGS_BIN"
+        echo "  Extracted mke2fs binary"
+    else
+        echo "ERROR: mke2fs not found in $E2FSPROGS_APK" >&2; exit 1
+    fi
+else
+    echo "  (cached: mke2fs-bin)"
+fi
+if [ ! -f "$WORK/libext2fs.so.2.4" ]; then
+    [ ! -f "$E2FSPROGS_LIBS_APK" ] && curl -L --progress-bar -o "$E2FSPROGS_LIBS_APK" "$E2FSPROGS_LIBS_URL"
+    [ ! -f "$LIBCOM_ERR_APK" ] && curl -L --progress-bar -o "$LIBCOM_ERR_APK" "$LIBCOM_ERR_URL"
+    E2FSLIBS_EXTRACT="$WORK/e2fsprogs-libs-extract"
+    rm -rf "$E2FSLIBS_EXTRACT" && mkdir -p "$E2FSLIBS_EXTRACT"
+    bsdtar -xf "$E2FSPROGS_LIBS_APK" -C "$E2FSLIBS_EXTRACT" 2>/dev/null || true
+    bsdtar -xf "$LIBCOM_ERR_APK"    -C "$E2FSLIBS_EXTRACT" 2>/dev/null || true
+    for lib in $(find "$E2FSLIBS_EXTRACT" -name "*.so.*" -not -name ".SIGN*" 2>/dev/null); do
+        cp "$lib" "$WORK/$(basename "$lib")"
+        echo "  Extracted $(basename "$lib")"
+    done
+else
+    echo "  (cached: e2fsprogs libs)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -416,6 +468,17 @@ if [ ! -f "$INITRAMFS_OUT" ] \
         echo "  staged virtio_console.ko"
     fi
 
+    # tun.ko: required by pasta (passt) to create TAP devices for pasta-mode
+    # networking in pelagos build RUN steps and pasta-mode containers.
+    TUN_KO="$NETMOD_BASE/drivers/net/tun.ko"
+    if [ -f "$TUN_KO" ]; then
+        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net"
+        cp "$TUN_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/net/tun.ko"
+        echo "  staged tun.ko"
+    else
+        echo "  WARNING: tun.ko not found in modloop" >&2
+    fi
+
     # overlayfs: add overlay.ko if present as a module.
     OVERLAY_KO="$NETMOD_BASE/fs/overlayfs/overlay.ko"
     if [ -f "$OVERLAY_KO" ]; then
@@ -425,6 +488,32 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     else
         echo "  overlay.ko not in modloop — assuming CONFIG_OVERLAY_FS=y (built-in)"
     fi
+
+    # virtio_blk.ko: provides /dev/vda (the persistent OCI image cache disk).
+    # Without this, /dev/vda does not exist and the ext2 mount fails — all OCI
+    # layer data goes to the root tmpfs and fills it up during large builds.
+    VBK_KO="$NETMOD_BASE/drivers/block/virtio_blk.ko"
+    if [ -f "$VBK_KO" ]; then
+        mkdir -p "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block"
+        cp "$VBK_KO" "$INITRD_TMP/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko"
+        echo "  staged virtio_blk.ko"
+    else
+        echo "  WARNING: virtio_blk.ko not found in modloop — /dev/vda will be unavailable" >&2
+    fi
+
+    # ext2 filesystem module (+ mbcache dep): needed to mount /dev/vda.
+    # ext2 is a module in linux-lts (not built-in).
+    for ko_rel in fs/mbcache.ko fs/ext2/ext2.ko; do
+        src="$MODLOOP_DIR/modules/$KVER/kernel/$ko_rel"
+        dst="$INITRD_TMP/lib/modules/$KVER/kernel/$ko_rel"
+        if [ -f "$src" ]; then
+            mkdir -p "$(dirname "$dst")"
+            cp "$src" "$dst"
+        else
+            echo "  WARNING: $ko_rel not found in modloop" >&2
+        fi
+    done
+    echo "  staged ext2 + mbcache modules"
 
     # Replace the Alpine initramfs's modules.dep with the one from the modloop.
     # The Alpine initramfs modules.dep only covers its bundled subset; ours
@@ -458,6 +547,25 @@ if [ ! -f "$INITRAMFS_OUT" ] \
     mkdir -p "$INITRD_TMP/usr/bin"
     cp "$PASTA_BIN" "$INITRD_TMP/usr/bin/pasta"
     chmod 755 "$INITRD_TMP/usr/bin/pasta"
+
+    # Add mke2fs + libs for formatting /dev/vda (persistent OCI image cache) on first boot.
+    # busybox in Alpine's initramfs-lts does not include the mke2fs applet.
+    if [ -f "$E2FSPROGS_BIN" ]; then
+        mkdir -p "$INITRD_TMP/sbin" "$INITRD_TMP/usr/lib"
+        cp "$E2FSPROGS_BIN" "$INITRD_TMP/sbin/mke2fs"
+        chmod 755 "$INITRD_TMP/sbin/mke2fs"
+        # Stage versioned .so files into /usr/lib and create soname symlinks.
+        for sofile in "$WORK"/lib*.so.*; do
+            [ -f "$sofile" ] || continue
+            fname="$(basename "$sofile")"
+            cp "$sofile" "$INITRD_TMP/usr/lib/$fname"
+            # Create soname symlink (strip minor version): e.g. libfoo.so.2.3 → libfoo.so.2
+            soname="$(echo "$fname" | sed 's/\(\.so\.[0-9]*\)\..*/\1/')"
+            [ "$soname" != "$fname" ] && ln -sf "$fname" "$INITRD_TMP/usr/lib/$soname"
+        done
+        echo "  staged mke2fs + e2fsprogs libs"
+    fi
+
 
     # Stage the host's public key as the VM's authorized_keys.
     mkdir -p "$INITRD_TMP/root/.ssh"
@@ -516,18 +624,31 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
     modprobe vmw_vsock_virtio_transport 2>/dev/null || true
     modprobe overlay             2>/dev/null || true
     modprobe virtio_net          2>/dev/null || true
+    modprobe virtio_blk          2>/dev/null || true
+    modprobe tun                 2>/dev/null || true
+    modprobe ext2                2>/dev/null || true
+    # Create /dev/net/tun device node.  The tun kernel module registers
+    # the device (char major 10, minor 200) but does not create the node
+    # automatically without udevd/mdev.  pasta requires /dev/net/tun to
+    # create TAP interfaces for pasta-mode container networking.
+    busybox mkdir -p /dev/net
+    busybox mknod /dev/net/tun c 10 200 2>/dev/null || true
+    busybox chmod 0666 /dev/net/tun 2>/dev/null || true
 
     echo "[pelagos-init] pass 1: modules loaded"
 
     busybox mkdir -p /newroot
-    busybox mount -t tmpfs -o size=512m tmpfs /newroot
+    busybox mount -t tmpfs -o size=2048m tmpfs /newroot
     for d in bin sbin usr lib etc root mnt var; do
         [ -d "/\$d" ] && busybox cp -a "/\$d" /newroot/ 2>/dev/null || true
     done
     busybox cp /init /newroot/init
     busybox mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/dev/pts \
+                     /newroot/dev/net \
                      /newroot/tmp /newroot/run /newroot/run/pelagos \
                      /newroot/sys/fs/cgroup /newroot/newroot
+    busybox mknod /newroot/dev/net/tun c 10 200 2>/dev/null || true
+    busybox chmod 0666 /newroot/dev/net/tun 2>/dev/null || true
 
     exec busybox switch_root /newroot /init
 
@@ -541,6 +662,12 @@ fi
 busybox mkdir -p /dev
 busybox mount -t devtmpfs devtmpfs /dev || true
 busybox mkdir -p /dev/pts
+# Ensure /dev/net/tun exists.  devtmpfs may or may not auto-create it from the
+# already-loaded tun module; create it explicitly as a safe fallback.
+# pasta (passt) requires /dev/net/tun to create TAP interfaces.
+busybox mkdir -p /dev/net
+busybox mknod /dev/net/tun c 10 200 2>/dev/null || true
+busybox chmod 0666 /dev/net/tun 2>/dev/null || true
 busybox mount -t devpts   devpts   /dev/pts 2>/dev/null || true
 busybox mount -t sysfs    sysfs    /sys 2>/dev/null || true
 busybox mkdir -p /sys/fs/cgroup
@@ -602,12 +729,22 @@ for kv in \$CMDLINE; do
 done
 
 busybox mkdir -p /var/lib/pelagos
-if busybox blkid /dev/vda 2>/dev/null | busybox grep -q ext2; then
-    busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null || true
+if busybox test -b /dev/vda; then
+    if busybox blkid /dev/vda 2>/dev/null | busybox grep -q ext2; then
+        busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null && \
+            echo "[pelagos-init] mounted /dev/vda (ext2) at /var/lib/pelagos" || \
+            echo "[pelagos-init] WARNING: ext2 mount of /dev/vda failed" >&2
+    elif busybox test -x /sbin/mke2fs; then
+        echo "[pelagos-init] formatting /dev/vda as ext2 for OCI image cache..."
+        /sbin/mke2fs -F -t ext2 /dev/vda 2>/dev/null && \
+            busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null && \
+            echo "[pelagos-init] formatted and mounted /dev/vda at /var/lib/pelagos" || \
+            echo "[pelagos-init] WARNING: ext2 format/mount failed — OCI cache in RAM" >&2
+    else
+        echo "[pelagos-init] WARNING: mke2fs missing — OCI cache will be in RAM" >&2
+    fi
 else
-    echo "[pelagos-init] formatting /dev/vda as ext2 for image cache..."
-    mke2fs -F /dev/vda 2>/dev/null && \
-        busybox mount -t ext2 /dev/vda /var/lib/pelagos 2>/dev/null || true
+    echo "[pelagos-init] WARNING: /dev/vda not found — OCI cache will be in RAM (tmpfs)" >&2
 fi
 
 if [ "\$PELAGOS_VOLUMES_PRESENT" = "1" ]; then
@@ -644,8 +781,8 @@ fi
 echo "[8/8] Creating placeholder disk image"
 # ---------------------------------------------------------------------------
 if [ ! -f "$DISK_IMG" ]; then
-    dd if=/dev/zero of="$DISK_IMG" bs=1m count=0 seek=512 2>/dev/null
-    echo "  disk: $DISK_IMG (512 MiB sparse, formatted on first boot)"
+    dd if=/dev/zero of="$DISK_IMG" bs=1m count=0 seek=8192 2>/dev/null
+    echo "  disk: $DISK_IMG (8192 MiB sparse, formatted on first boot via VM init)"
 else
     echo "  (cached: $DISK_IMG)"
 fi

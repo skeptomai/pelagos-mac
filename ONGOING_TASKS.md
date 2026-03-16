@@ -1,6 +1,6 @@
 # pelagos-mac — Ongoing Tasks
 
-*Last updated: 2026-03-13, SHA (chore/nat-diagnostics branch)*
+*Last updated: 2026-03-16, branch fix/exec-into-container-env*
 
 ---
 
@@ -51,8 +51,9 @@ All sub-issues resolved:
 | devcontainer up smoke test | #66 | ✅ PR #66 |
 | docker build, volume, network | #68 | ✅ PR #70 |
 | docker cp | #69 | ✅ PR #71 |
-
----
+| overlayfs / linux-lts kernel | #89 | ✅ PR #90 |
+| docker build multi-stage + features test | #92 | 🔶 blocked on pelagos#114 (image ENV not applied) |
+| VS Code full extension integration test | #91 | 🔲 |
 
 ---
 
@@ -60,17 +61,28 @@ All sub-issues resolved:
 
 ### VS Code devcontainer — ready to re-test
 
-pelagos v0.27.1 (epic #96) replaced `chroot` with `pivot_root` as the default
-root isolation mechanism. After `setns(mnt_fd)`, the mount namespace root is now
-the container's rootfs directly (old root detached via `MNT_DETACH`). The guest
-daemon's `handle_exec_into` (setns-only, no extra chroot step) now correctly lands
-inside the container filesystem.
+T2 integration harness (`scripts/test-devcontainer-e2e.sh`) is built and running.
+Current result: **Suites A (7/7), B (3/3), D (3/3) pass. Suite C: 1/3 pass.**
 
-The blocker that closed PR #85 is gone. The `fix/exec-into-chroot` branch and
-its workaround are superseded — the current unmodified master code is correct.
+Suite C TC-T2-10b/10c (`node --version`, `npm --version`) fail with
+`exec spawn failed: No such file or directory` because `pelagos run` does not
+apply the image's Dockerfile `ENV` layer to the container process environment.
+Node is installed but `PATH` does not include `/usr/local/share/nvm/current/bin`.
 
-**Next step:** Run VS Code "Reopen in Container" against `devcontainer-test` and
-trace any remaining failures in the exec/lifecycle flow.
+**Blocked on pelagos#114** — filed 2026-03-16.
+No workaround in the shim (CLAUDE.md: fix belongs in pelagos).
+
+This branch (fix/exec-into-container-env) also contains:
+- `exec-into` `-w`/`--workdir` support (container working directory)
+- `devcontainer up` probe detection fix for CLI 0.84+ built-in keepalive
+- `RUST_LOG=debug` removed from VM init script (was causing output noise)
+- Default VM memory increased to 2048 MiB (OOM fix for Node.js nvm install)
+- Persistent disk increased to 8192 MiB
+
+### VS Code full extension integration test (#91)
+
+Run VS Code "Reopen in Container" against a project with a `.devcontainer/`
+and verify: IDE attaches, extensions install, terminal opens inside container.
 
 ### pelagos-mac — Lower priority
 

@@ -40,8 +40,8 @@ struct Cli {
     #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0")]
     cmdline: String,
 
-    /// Memory in MiB (default 1024)
-    #[arg(long, default_value = "1024")]
+    /// Memory in MiB (default 2048)
+    #[arg(long, default_value = "2048")]
     memory: usize,
 
     /// Number of vCPUs (default 2)
@@ -108,6 +108,9 @@ enum Commands {
         /// User to run command as (passed to guest, runs as this user inside container).
         #[arg(short = 'u', long)]
         user: Option<String>,
+        /// Working directory inside the container.
+        #[arg(short = 'w', long)]
+        workdir: Option<String>,
     },
     /// List containers (running by default; use -a for all)
     Ps {
@@ -274,6 +277,9 @@ enum GuestCommand {
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
         tty: bool,
+        /// Working directory inside the container (Docker exec -w).
+        #[serde(default)]
+        workdir: Option<String>,
     },
     /// Open a shell directly in the VM (no container, no namespaces).
     Shell {
@@ -619,9 +625,11 @@ fn main() {
             ref args,
             tty,
             user: _,
+            ref workdir,
         } => {
             let container = container.clone();
             let args = args.clone();
+            let workdir = workdir.clone();
             let tty = tty || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
             // Fix A ensures all commands start the daemon with the same virtiofs
             // shares ($HOME as share0), so ensure_running is safe here — no
@@ -640,6 +648,7 @@ fn main() {
                     args,
                     env: std::collections::HashMap::new(),
                     tty,
+                    workdir,
                 },
                 tty,
             ));
