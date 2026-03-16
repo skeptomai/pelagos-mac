@@ -101,6 +101,9 @@ enum DockerCmd {
         /// User to run the command as (passed through to exec-into).
         #[arg(short = 'u', long = "user")]
         user: Option<String>,
+        /// Working directory inside the container.
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
         /// Detach keys (ignored).
         #[arg(long = "detach-keys")]
         detach_keys: Option<String>,
@@ -287,6 +290,7 @@ fn main() {
             tty,
             env,
             user,
+            workdir,
             detach_keys: _,
             name_and_args,
         } => cmd_exec(
@@ -294,6 +298,7 @@ fn main() {
             interactive,
             tty,
             user.as_deref(),
+            workdir.as_deref(),
             &env,
             &name_and_args,
         ),
@@ -441,13 +446,19 @@ fn cmd_run(cfg: &Config, opts: RunOpts) -> i32 {
 
     // Detect the devcontainer probe pattern:
     //   docker run --sig-proxy=false ... /bin/sh -c "echo Container started"
-    // VS Code sends this to verify the container image is runnable. The container
-    // exits in milliseconds, after which VS Code calls `docker exec` — but by then
-    // the PID is dead and may be reused by an Alpine process, causing exec to enter
-    // the wrong namespace. We intercept this: run the container detached with a
-    // sleep keepalive appended, suppress pelagos's output, and synthesize the
-    // expected "Container started" line ourselves.
-    let is_probe = sig_proxy.as_deref() == Some("false")
+    // Older devcontainer CLI versions send just `echo Container started` with no
+    // keepalive — the container exits immediately and exec-into would fail. We
+    // intercept this case: run detached with a keepalive appended, suppress
+    // pelagos's output, and synthesize the expected "Container started" line.
+    //
+    // devcontainer CLI 0.84+ sends a command that ALREADY includes a keepalive
+    // loop (`while sleep 1 & wait $!; do :; done`). In that case the run must
+    // BLOCK for the container's lifetime — do NOT intercept it.
+    let has_builtin_keepalive = image_and_args
+        .iter()
+        .any(|a| a.contains("while sleep") || (a.contains("while ") && a.contains("wait $!")));
+    let is_probe = !has_builtin_keepalive
+        && sig_proxy.as_deref() == Some("false")
         && image_and_args
             .iter()
             .any(|a| a.contains("echo Container started"));
@@ -564,6 +575,7 @@ fn cmd_exec(
     _interactive: bool,
     tty: bool,
     user: Option<&str>,
+    workdir: Option<&str>,
     _env: &[String],
     name_and_args: &[String],
 ) -> i32 {
@@ -584,6 +596,10 @@ fn cmd_exec(
     if let Some(u) = user {
         sub.push("--user".into());
         sub.push(u.into());
+    }
+    if let Some(w) = workdir {
+        sub.push("-w".into());
+        sub.push(w.into());
     }
     sub.push(name.into());
     for a in cmd_args {
@@ -1187,6 +1203,153 @@ fn build_ports_map(_container: &str, port_map: &[(u16, u16)]) -> HashMap<String,
 // Build / Volume / Network
 // ---------------------------------------------------------------------------
 
+/// Parse `FROM <image> [AS <name>]` lines from a Dockerfile and return the
+/// external base images that need to be pulled (skips `scratch` and
+/// stage-alias forward-references from earlier multi-stage stages).
+fn parse_from_images(dockerfile: &str) -> Vec<String> {
+    let mut stage_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut images: Vec<String> = Vec::new();
+    for line in dockerfile.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !trimmed.to_uppercase().starts_with("FROM ") {
+            continue;
+        }
+        let rest = trimmed[5..].trim();
+        let (image_part, alias) = if let Some(idx) = rest.to_uppercase().find(" AS ") {
+            (rest[..idx].trim(), Some(rest[idx + 4..].trim()))
+        } else {
+            (rest, None)
+        };
+        // Strip optional platform flag: --platform=linux/amd64 <image>
+        let image = if image_part.starts_with("--") {
+            image_part
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            image_part.to_string()
+        };
+        if let Some(name) = alias {
+            stage_names.insert(name.to_lowercase());
+        }
+        // Skip scratch, build-arg references, and known stage aliases
+        if image.is_empty()
+            || image == "scratch"
+            || image.starts_with('$')
+            || stage_names.contains(&image.to_lowercase())
+        {
+            continue;
+        }
+        images.push(image);
+    }
+    images
+}
+
+/// Pull a single image using the run-probe mechanism.
+/// pelagos has no `image pull` command; the only way to populate the local
+/// image cache is to run a container (which triggers an implicit pull).
+fn pull_image_probe(cfg: &Config, image: &str) -> i32 {
+    // Sanitize the image name into a valid container name (alphanumeric + dash).
+    let safe: String = image
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let probe_name = format!("pelagos-docker-pull-{}", &safe[..safe.len().min(40)]);
+
+    let mut sub = args(&["run", "--detach", "--name", &probe_name]);
+    sub.push(OsString::from(image));
+    sub.push(OsString::from("/bin/true"));
+
+    let out = match run_pelagos(cfg, &sub) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("pelagos-docker build: pull probe for {}: {}", image, e);
+            return 1;
+        }
+    };
+    let _ = run_pelagos(cfg, &args(&["stop", &probe_name]));
+    let _ = run_pelagos(cfg, &args(&["rm", &probe_name]));
+    if out.status.success() {
+        0
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "pelagos-docker build: pull {} failed: {}",
+            image,
+            stderr.trim()
+        );
+        out.status.code().unwrap_or(1)
+    }
+}
+
+/// Pull all base images referenced in `dockerfile_path`.
+/// `build_args` are substituted into the Dockerfile text before parsing, so
+/// `FROM ${_DEV_CONTAINERS_BASE_IMAGE}` (used by the devcontainer features
+/// build) resolves to the real registry image.
+///
+/// Only attempts to pull images that look like registry references (contain a
+/// `.` or `/` in the name part) — locally-built tags like
+/// `dev_container_feature_content_temp` are skipped.
+fn pull_base_images(cfg: &Config, dockerfile_path: &str, build_args: &[String]) -> i32 {
+    let raw = match std::fs::read_to_string(dockerfile_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "pelagos-docker build: cannot read Dockerfile {}: {}",
+                dockerfile_path, e
+            );
+            return 1;
+        }
+    };
+
+    // Build a substitution map from --build-arg KEY=VALUE pairs.
+    let mut arg_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for arg in build_args {
+        if let Some(eq) = arg.find('=') {
+            arg_map.insert(arg[..eq].to_string(), arg[eq + 1..].to_string());
+        }
+    }
+
+    // Substitute ${VAR} and $VAR references in the Dockerfile text.
+    let content = if arg_map.is_empty() {
+        raw
+    } else {
+        let mut s = raw;
+        for (k, v) in &arg_map {
+            s = s.replace(&format!("${{{}}}", k), v);
+            s = s.replace(&format!("${}", k), v);
+        }
+        s
+    };
+
+    for image in parse_from_images(&content) {
+        // Skip images that have no dot or slash in the name part — they are
+        // locally-built tags (e.g. `dev_container_feature_content_temp`), not
+        // registry references. Registry images always include a hostname dot
+        // (e.g. `public.ecr.aws/...`) or at minimum a slash (e.g. `library/ubuntu`).
+        let name_part = image.split(':').next().unwrap_or(&image);
+        if !name_part.contains('.') && !name_part.contains('/') {
+            continue;
+        }
+        eprintln!("pelagos-docker build: pulling base image {}", image);
+        let rc = pull_image_probe(cfg, &image);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    0
+}
+
 fn cmd_build(
     cfg: &Config,
     tag: &str,
@@ -1196,6 +1359,13 @@ fn cmd_build(
     target: Option<&str>,
     context: &str,
 ) -> i32 {
+    // Pull all FROM base images first — pelagos build requires them locally,
+    // Docker does this transparently as part of build.
+    let rc = pull_base_images(cfg, file, build_args);
+    if rc != 0 {
+        return rc;
+    }
+
     let mut sub: Vec<OsString> = args(&["build", "-t", tag, "-f", file]);
     for arg in build_args {
         sub.push("--build-arg".into());

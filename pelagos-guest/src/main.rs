@@ -116,6 +116,9 @@ pub enum GuestCommand {
         env: std::collections::HashMap<String, String>,
         #[serde(default)]
         tty: bool,
+        /// Working directory inside the container (Docker exec -w).
+        #[serde(default)]
+        workdir: Option<String>,
     },
     /// List containers; maps to `pelagos ps [--all]`.
     Ps {
@@ -339,8 +342,9 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 args,
                 env,
                 tty,
+                workdir,
             } => {
-                handle_exec_into(fd, &container, &args, &env, tty)?;
+                handle_exec_into(fd, &container, &args, &env, tty, workdir.as_deref())?;
                 return Ok(());
             }
             GuestCommand::Ps { all } => {
@@ -1251,6 +1255,7 @@ fn handle_exec_into(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     tty: bool,
+    workdir: Option<&str>,
 ) -> std::io::Result<()> {
     let pid = get_container_pid(container).map_err(|e| {
         let mut w = FdWriter(fd);
@@ -1315,9 +1320,34 @@ fn handle_exec_into(
         }
     };
 
+    // Build the child environment: start from the container's init process
+    // environment (which carries the OCI image's configured ENV, including PATH),
+    // then overlay caller-supplied overrides.  env_clear() prevents the Alpine
+    // guest environment from leaking through.
+    let mut container_env = read_container_environ(pid);
+    log::debug!(
+        "exec-into: container={} pid={} root_pid={} container_env_keys={} PATH={:?}",
+        container,
+        pid,
+        find_root_pid(pid),
+        container_env.len(),
+        container_env.get("PATH")
+    );
+    for (k, v) in env {
+        container_env.insert(k.clone(), v.clone());
+    }
+
+    log::debug!(
+        "exec-into: prog={:?} args={:?} final_env_keys={}",
+        prog,
+        rest,
+        container_env.len()
+    );
+
     let mut cmd = Command::new(prog);
     cmd.args(rest);
-    for (k, v) in env {
+    cmd.env_clear();
+    for (k, v) in &container_env {
         cmd.env(k, v);
     }
 
@@ -1326,6 +1356,8 @@ fn handle_exec_into(
     // Order: net/uts/ipc first, pid before mnt (so /proc stays readable).
     // After all setns calls, fchdir+chroot into the container's rootfs so that
     // absolute paths resolve through the container filesystem, not the guest root.
+    let workdir_owned: Option<std::ffi::CString> = workdir
+        .and_then(|w| std::ffi::CString::new(w.as_bytes()).ok());
     unsafe {
         cmd.pre_exec(move || {
             for &ns_fd in &ns_fds {
@@ -1341,7 +1373,12 @@ fn handle_exec_into(
             if libc::chroot(b".\0".as_ptr() as *const libc::c_char) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) < 0 {
+            // chdir to the requested working directory (Docker exec -w), or / by default.
+            let dir_ptr = match workdir_owned.as_ref() {
+                Some(cstr) => cstr.as_ptr(),
+                None => b"/\0".as_ptr() as *const libc::c_char,
+            };
+            if libc::chdir(dir_ptr) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             libc::close(root_fd);
@@ -1409,6 +1446,48 @@ unsafe fn call_setns(fd: libc::c_int) -> libc::c_int {
 #[cfg(not(target_os = "linux"))]
 unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
     panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// Read the environment of the container's root process from `/proc/<pid>/environ`.
+///
+/// Uses `find_root_pid` so we read from the process that actually called
+/// `pivot_root` (and therefore has the container's OCI-configured ENV).
+/// Returns an empty map on any read/parse failure — callers treat it as
+/// best-effort.
+fn read_container_environ(pid: u32) -> std::collections::HashMap<String, String> {
+    let root_pid = find_root_pid(pid);
+    let path = format!("/proc/{}/environ", root_pid);
+    let mut map = std::collections::HashMap::new();
+    match std::fs::read(&path) {
+        Ok(data) => {
+            for entry in data.split(|&b| b == 0) {
+                if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
+                    let key = String::from_utf8_lossy(&entry[..eq_pos]).into_owned();
+                    let val = String::from_utf8_lossy(&entry[eq_pos + 1..]).into_owned();
+                    if !key.is_empty() {
+                        map.insert(key, val);
+                    }
+                }
+            }
+            log::debug!(
+                "read_container_environ: pid={} root_pid={} read {} bytes → {} vars",
+                pid,
+                root_pid,
+                data.len(),
+                map.len()
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "read_container_environ: pid={} root_pid={} failed to read {}: {}",
+                pid,
+                root_pid,
+                path,
+                e
+            );
+        }
+    }
+    map
 }
 
 /// Resolve the PID that actually called `pivot_root` for the container.

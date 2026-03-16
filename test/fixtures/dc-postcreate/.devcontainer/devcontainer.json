@@ -1,0 +1,8 @@
+{
+  "name": "pelagos-test-postcreate",
+  "image": "public.ecr.aws/docker/library/ubuntu:22.04",
+  "postCreateCommand": "touch /tmp/pelagos-postcreate-ran && echo postcreate-done",
+  "containerEnv": {
+    "PELAGOS_TEST": "postcreate"
+  }
+}
