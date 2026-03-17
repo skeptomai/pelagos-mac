@@ -1637,7 +1637,17 @@ fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
     let path = format!("/proc/{}/root", root_pid);
     let cpath = std::ffi::CString::new(path.as_str())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    // O_CLOEXEC is safe here: pre_exec runs after fork() but before exec(), so
+    // the fd is still accessible in pre_exec.  O_CLOEXEC only closes it at exec()
+    // time, which prevents it leaking into unrelated child processes spawned by
+    // pelagos-guest on other threads — without this, every subprocess inherits
+    // all open namespace fds, exhausting the fd table (EMFILE).
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1654,8 +1664,11 @@ fn open_ns_fds(pid: u32) -> std::io::Result<[libc::c_int; 5]> {
         let path = format!("/proc/{}/ns/{}", pid, ns);
         let cpath = std::ffi::CString::new(path.as_str())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        // No O_CLOEXEC: fd must survive into pre_exec (before exec).
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+        // O_CLOEXEC is safe here: pre_exec runs after fork() but before exec(),
+        // so the fd is accessible in pre_exec.  It only closes at exec() time,
+        // preventing leakage into unrelated child processes (which would exhaust
+        // the fd table and cause EMFILE).
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             for fd in fds.iter().take(i) {
                 unsafe { libc::close(*fd) };
