@@ -509,14 +509,11 @@ if suite_active E; then
         skip "TC-T2-12: containerId not in result JSON (cannot test stop)"
     fi
 
-    # TC-T2-13: pelagos start restarts the container (plumbing check)
-    #   `devcontainer up` (docker start) is blocked by pelagos#118: pelagos start
-    #   stays alive as a keepalive instead of returning once the container is running.
-    #   Test the underlying pelagos plumbing directly instead.
+    # TC-T2-13: pelagos start restarts the container (pelagos#118 fixed in v0.56.0:
+    #   watcher child now redirects stdio to /dev/null so caller sees EOF promptly)
     if [ -n "$E_CONT" ]; then
-        pelagos start "$E_CONT" >/dev/null 2>&1 &
-        START_PID=$!
-        sleep 3  # give container time to start
+        pelagos start "$E_CONT" >/dev/null 2>&1
+        sleep 1
         E_STATUS2=$(pelagos ps --all 2>/dev/null | awk -v n="$E_CONT" '$1==n {print $2}')
         if [ "$E_STATUS2" = "running" ]; then
             pass "TC-T2-13: pelagos start: container back to running state"
@@ -527,7 +524,7 @@ if suite_active E; then
         skip "TC-T2-13: containerId not in result JSON"
     fi
 
-    # TC-T2-14: exec works in restarted container (pelagos exec-into directly)
+    # TC-T2-14: exec works in restarted container
     if [ -n "$E_CONT" ]; then
         E_EXEC=$(pelagos exec-into "$E_CONT" uname -s 2>&1 | tr -d '\r\n')
         if [ "$E_EXEC" = "Linux" ]; then
@@ -539,14 +536,41 @@ if suite_active E; then
         skip "TC-T2-14: containerId not in result JSON"
     fi
 
-    # TC-T2-15: devcontainer up after stop — BLOCKED on pelagos#118
-    #   docker start → pelagos start stays alive as keepalive → shim blocks forever.
-    #   When pelagos#118 is fixed, replace this skip with the full devcontainer up test.
-    skip "TC-T2-15: devcontainer up after container stop (blocked: pelagos#118 — pelagos start must return once container is running)"
-
-    # Teardown: stop the background pelagos start keepalive and clean up
-    [ -n "${START_PID:-}" ] && kill "$START_PID" 2>/dev/null || true
+    # TC-T2-15: devcontainer up after stop — full devcontainer CLI restart path
+    #   (pelagos#118 fixed: pelagos start now returns promptly)
+    printf "  Running devcontainer up (restart stopped container via devcontainer CLI)...\n"
+    : > "$DC_INVOCATION_LOG"
+    # stop the container again so devcontainer up must call docker start
+    [ -n "$E_CONT" ] && pelagos stop "$E_CONT" >/dev/null 2>&1 || true
     sleep 1
+    E_UP2_OUT=$(dc up --workspace-folder "$WS_E" 2>&1)
+    E_UP2_RC=$?
+    E_RESULT2=$(echo "$E_UP2_OUT" | tail -1)
+    E_CONT2=$(dc_result_field "$E_RESULT2" "containerId")
+    [ "$DEBUG" -eq 1 ] && dump "devcontainer up (restart) output" "$E_UP2_OUT"
+
+    if [ "$E_UP2_RC" -eq 0 ] && [ "$(dc_result_field "$E_RESULT2" "outcome")" = "success" ]; then
+        pass "TC-T2-15: devcontainer up after stop: exit 0, outcome=success"
+    else
+        DUMP_ON_FAIL=1 dump "up output" "$E_UP2_OUT"; DUMP_ON_FAIL=0
+        fail "TC-T2-15: devcontainer up after stop" \
+             "exit=$E_UP2_RC outcome=$(dc_result_field "$E_RESULT2" "outcome")" "exit=0 outcome=success"
+    fi
+
+    # TC-T2-16: docker start (not docker run) was called for the restart
+    if [ -n "$E_CONT" ]; then
+        if grep -q "^start " "$DC_INVOCATION_LOG" 2>/dev/null; then
+            pass "TC-T2-16: docker start called for restart (not a fresh docker run)"
+        else
+            INVOCATIONS=$(cat "$DC_INVOCATION_LOG" 2>/dev/null)
+            DUMP_ON_FAIL=1 dump "invocation log" "$INVOCATIONS"; DUMP_ON_FAIL=0
+            fail "TC-T2-16: docker start called for restart" \
+                 "$(grep '^run\|^start' "$DC_INVOCATION_LOG" 2>/dev/null | head -3)" "start $E_CONT"
+        fi
+    else
+        skip "TC-T2-16: containerId not in result JSON"
+    fi
+
     dc_down "$WS_E"
     echo ""
 fi
