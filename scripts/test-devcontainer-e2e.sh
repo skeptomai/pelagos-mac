@@ -143,10 +143,50 @@ dc_down() {
     done
 }
 
+# Stop all containers running inside the VM and kill orphaned host-side
+# pelagos/devcontainer processes.  Called between suites.
+#
+# Why not restart the VM:
+# - Restarting destroys the repro environment for VM stability bugs.
+# - Proper cleanup is: kill host orphans, wait for guest to detect the
+#   dropped vsock connections, then stop every container via pelagos.
+# - With cmd_events seeding removed, stale containers are no longer a
+#   correctness hazard — but they still waste VM memory, so clean them.
+cleanup_vm() {
+    # 1. Kill orphaned devcontainer and shim processes from previous suites.
+    pkill -KILL -f "devcontainer up --docker-path" 2>/dev/null || true
+    pkill -KILL -f "$SHIM" 2>/dev/null || true
+    # Kill pelagos subcommand processes (run, ps, etc.) but NOT vm-daemon-internal.
+    # The daemon's argv has --disk before --initrd; subcommands have --initrd before --disk.
+    pkill -KILL -f "$BINARY --kernel.*--initrd.*--disk" 2>/dev/null || true
+    # 2. Give guest time to detect the dropped vsock connections and clean up.
+    sleep 2
+    # 3. Stop + rm every container in the VM (running or exited).
+    #    Removing exited containers prevents devcontainer CLI from finding stale
+    #    containers by label and calling `docker start`, which hangs because
+    #    `pelagos start` is a keepalive that never returns.
+    local names
+    names=$(pelagos ps --all 2>/dev/null | awk 'NR>1 {print $1}')
+    for name in $names; do
+        pelagos stop "$name" >/dev/null 2>&1 || true
+    done
+    if [ -n "$names" ]; then
+        sleep 1  # give containers time to exit after stop
+        for name in $names; do
+            pelagos rm "$name" >/dev/null 2>&1 || true
+        done
+    fi
+    # 4. Verify — warn but don't abort if stragglers remain.
+    local remaining
+    remaining=$(pelagos ps --all 2>/dev/null | awk 'NR>1 {print $1}')
+    if [ -n "$remaining" ]; then
+        printf "  [WARN] containers still present after cleanup: %s\n" "$remaining"
+    fi
+}
+
 # Clean up all containers from a fixture before running its suite.
 cleanup_fixture() {
-    local workspace="$1"
-    dc_down "$workspace" 2>/dev/null || true
+    cleanup_vm
 }
 
 suite_active() {
