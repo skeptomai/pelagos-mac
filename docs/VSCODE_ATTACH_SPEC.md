@@ -351,9 +351,9 @@ the macOS host. (pelagos-mac handles port forwarding via `pelagos run -p`.)
 |---|---|---|
 | pelagos#120 — `/etc/hosts` absent | **CLOSED** | pelagos v0.57.0 |
 | pelagos-mac exec stdin BufReader | **CLOSED** | branch fix/devcontainer-suite-isolation |
-| pelagos#TBD — exec-into missing PID namespace join | **OPEN — CURRENT BLOCKER** | TBD |
+| pelagos#121 — exec-into missing PID namespace join | **OPEN — CURRENT BLOCKER** | TBD |
 
-### Current Blocker: exec-into PID namespace (pelagos#TBD)
+### Current Blocker: exec-into PID namespace (pelagos#121)
 
 VS Code's `resolveAuthority` runs `aT()` which proc-scans the container and ends with
 `readlink /proc/self/ns/mnt 2>/dev/null`. This fails in pelagos containers because

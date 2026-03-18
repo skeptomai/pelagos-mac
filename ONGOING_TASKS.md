@@ -85,7 +85,7 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
    `pelagos-mac/src/main.rs` `exec_command` stdin thread: replaced `io::stdin().read()`
    with `libc::read(STDIN_FILENO,...)`. Committed and merged.
 
-3. **pelagos#TBD — exec-into does not join the container's PID namespace.**
+3. **pelagos#121 — exec-into does not join the container's PID namespace.**
    VS Code's `resolveAuthority` runs a process scan (`aT()` function) that ends with
    `readlink /proc/self/ns/mnt 2>/dev/null`. In pelagos containers this fails (exit
    code 1) because exec-into processes run outside the container's PID namespace:
