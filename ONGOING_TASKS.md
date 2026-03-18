@@ -1,17 +1,17 @@
 # pelagos-mac — Ongoing Tasks
 
 
-*Last updated: 2026-03-17*
+*Last updated: 2026-03-18*
 
 ---
 
 ## Current State
 
-**Phase 4 (VS Code devcontainer support) largely complete.** The Docker CLI shim
-covers the full devcontainer lifecycle including `docker build` (native via
-`pelagos build` — no Docker Desktop or buildah), `docker cp`, volumes, and
-networks. Multi-stage build support and end-to-end devcontainer features testing
-remain (issues #91, #92).
+**Phase 4 (VS Code devcontainer support) complete.** The Docker CLI shim covers
+the full devcontainer lifecycle. The exec-into PID namespace blocker
+(pelagos#121) is now fixed in pelagos-guest using a hybrid nsenter approach.
+All 22 devcontainer e2e tests (Suites A–E) pass. VS Code "Reopen in Container"
+is ready for manual verification.
 
 ### What works today
 
@@ -65,51 +65,35 @@ remain (issues #91, #92).
 ### VS Code devcontainer — current state
 
 T2 integration harness (`scripts/test-devcontainer-e2e.sh`) is built and running.
-Current result: **Suite A/B/C/D: 16/16 PASS.**
-
-All Suite C tests now pass (node v24.14.0, npm 11.9.0) with pelagos v0.53.0
-(fixes exec-into ENV/PATH, issue #115) and the host-clock-sync fix
-(VM clock injected via `clock.utc=` in kernel cmdline, no NTP on startup path).
+Current result: **Suite A/B/C/D/E: 22/22 PASS** (with pelagos v0.58.0 + nsenter fix).
 
 ### VS Code full extension integration test (#91)
 
 Run VS Code "Reopen in Container" against a project with a `.devcontainer/`
 and verify: IDE attaches, extensions install, terminal opens inside container.
 
-**Blockers (in order):**
+**All known blockers are resolved:**
 
 1. **pelagos#120** — container `/etc/hosts` not created. **CLOSED in pelagos v0.57.0.**
-   `/etc/hosts` is now populated correctly.
 
-2. **exec-into stdin BufReader fix** (pelagos-mac#103, now CLOSED) — applied in
-   `pelagos-mac/src/main.rs` `exec_command` stdin thread: replaced `io::stdin().read()`
-   with `libc::read(STDIN_FILENO,...)`. Committed and merged.
+2. **exec-into stdin BufReader fix** (pelagos-mac#103) — CLOSED. Applied in
+   `pelagos-mac/src/main.rs`: replaced `io::stdin().read()` with `libc::read(STDIN_FILENO,...)`.
 
-3. **pelagos#121 — exec-into does not join the container's PID namespace.**
-   VS Code's `resolveAuthority` runs a process scan (`aT()` function) that ends with
-   `readlink /proc/self/ns/mnt 2>/dev/null`. In pelagos containers this fails (exit
-   code 1) because exec-into processes run outside the container's PID namespace:
-   `/proc/self` is a 0-byte dangling symlink. The shell server exec rejects on non-zero
-   exit, causing `Ioe()` → `resolveAuthority()` to fail with `NotAvailable`.
+3. **pelagos#121 — exec-into PID namespace join.** **FIXED in this branch.**
+   Root cause: `setns(CLONE_NEWPID)` in `pre_exec` (after fork) only sets
+   `pid_for_children`; a second fork is required for the process to acquire a
+   namespace-local PID. Without it, `/proc/self` is a dangling symlink, causing
+   VS Code `resolveAuthority` to fail.
 
-   **Root cause:** `exec_into` in pelagos joins mount/net/ipc/uts namespaces but does
-   not call `setns()` for `CLONE_NEWPID`. As a result, exec'd processes are invisible
-   in the container's `/proc` and `/proc/self` does not resolve.
+   **Fix (pelagos-guest/src/main.rs `handle_exec_into`):**
+   - `pre_exec` joins net/uts/ipc/mnt namespaces and fchdir+chroots into container rootfs.
+   - The command is wrapped: `nsenter --target 1 --pid -- <prog> <args>`. After chroot,
+     `/proc` is the container's procfs; nsenter performs the correct double-fork from
+     a single-threaded context, giving the exec'd process a container-local PID.
+   - `nsenter` (util-linux) is staged into the initramfs from Alpine's
+     `util-linux-misc-2.40.4-r1.apk`.
 
-   **Reproduction:**
-   ```bash
-   pelagos-docker exec -i <container> /bin/sh
-   # inside: ls -la /proc/self  → 0-byte dangling symlink
-   # inside: ls /proc/[0-9]*    → only shows container init PID
-   ```
-
-   **Fix required in pelagos:** `exec_into` must call `setns(pid_ns_fd, CLONE_NEWPID)`
-   before fork/exec, so exec'd processes appear in the container's PID namespace and
-   `/proc/self` resolves correctly.
-
-   **Impact on VS Code attach:** Without this fix, `resolveAuthority` always fails at
-   T+~4s with `{"code":"NotAvailable","detail":true}`. The muxrpc, server install,
-   and port forwarding layers all work correctly — this is the only remaining blocker.
+   **Verified:** `mypid=2`, `readlink /proc/self/ns/mnt` → `mnt:[4026532138]`, exit 0.
 
 ### pelagos-mac — Lower priority
 
@@ -125,9 +109,15 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
 
 ## Key Architecture Notes
 
-- **`pelagos exec` subprocess cannot enter container namespaces** from inside the
-  guest daemon — it silently runs in the guest root instead. Always use direct
-  `setns(2)` via `pre_exec`. See `docs/GUEST_CONTAINER_EXEC.md`.
+- **exec-into PID namespace:** `setns(CLONE_NEWPID)` in `pre_exec` (child after fork)
+  only sets `pid_for_children`; a second fork is required. Use the nsenter hybrid:
+  `pre_exec` joins non-PID namespaces + chroots, then wrap with
+  `nsenter --target 1 --pid -- <prog>`. See `docs/GUEST_CONTAINER_EXEC.md`.
+- **socket_vmnet degradation:** if image pulls fail with "I/O error (os error 5)",
+  run `sudo brew services restart socket_vmnet`, kill stale VM processes, then
+  remove and recreate `~/.local/share/pelagos/vm.pid` before restarting.
+  The old root.img may also become invalid (AVF: "storage device attachment invalid")
+  if the VM was killed mid-write — delete `out/root.img` and rerun `build-vm-image.sh`.
 - **VM networking:** socket_vmnet, subnet `192.168.105.x`, gateway `192.168.105.1`.
   Homebrew socket path: `/opt/homebrew/var/run/socket_vmnet` (no `.shared` suffix).
 - **`pelagos build` uses `--network pasta`** inside the VM. `pasta` (userspace
