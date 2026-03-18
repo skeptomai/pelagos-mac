@@ -78,16 +78,38 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
 
 **Blockers (in order):**
 
-1. **pelagos#120** — container `/etc/hosts` not created. VS Code server (Node.js)
-   calls `getaddrinfo("localhost")` at startup; fails with `ENOTFOUND`. Server logs
-   the error and VS Code cannot connect. Fix: pelagos must write `/etc/hosts` with
-   `127.0.0.1 localhost` at container creation (same as Docker). Tracked in
-   pelagos-mac#104.
+1. **pelagos#120** — container `/etc/hosts` not created. **CLOSED in pelagos v0.57.0.**
+   `/etc/hosts` is now populated correctly.
 
 2. **exec-into stdin BufReader fix** (pelagos-mac#103, now CLOSED) — applied in
    `pelagos-mac/src/main.rs` `exec_command` stdin thread: replaced `io::stdin().read()`
-   with `libc::read(STDIN_FILENO,...)`. Both `dd` transfers now complete instantly
-   (74 MB in 1.3 s, 6.8 KB in 16 µs). Needs to be committed and merged.
+   with `libc::read(STDIN_FILENO,...)`. Committed and merged.
+
+3. **pelagos#TBD — exec-into does not join the container's PID namespace.**
+   VS Code's `resolveAuthority` runs a process scan (`aT()` function) that ends with
+   `readlink /proc/self/ns/mnt 2>/dev/null`. In pelagos containers this fails (exit
+   code 1) because exec-into processes run outside the container's PID namespace:
+   `/proc/self` is a 0-byte dangling symlink. The shell server exec rejects on non-zero
+   exit, causing `Ioe()` → `resolveAuthority()` to fail with `NotAvailable`.
+
+   **Root cause:** `exec_into` in pelagos joins mount/net/ipc/uts namespaces but does
+   not call `setns()` for `CLONE_NEWPID`. As a result, exec'd processes are invisible
+   in the container's `/proc` and `/proc/self` does not resolve.
+
+   **Reproduction:**
+   ```bash
+   pelagos-docker exec -i <container> /bin/sh
+   # inside: ls -la /proc/self  → 0-byte dangling symlink
+   # inside: ls /proc/[0-9]*    → only shows container init PID
+   ```
+
+   **Fix required in pelagos:** `exec_into` must call `setns(pid_ns_fd, CLONE_NEWPID)`
+   before fork/exec, so exec'd processes appear in the container's PID namespace and
+   `/proc/self` resolves correctly.
+
+   **Impact on VS Code attach:** Without this fix, `resolveAuthority` always fails at
+   T+~4s with `{"code":"NotAvailable","detail":true}`. The muxrpc, server install,
+   and port forwarding layers all work correctly — this is the only remaining blocker.
 
 ### pelagos-mac — Lower priority
 

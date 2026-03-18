@@ -350,7 +350,33 @@ the macOS host. (pelagos-mac handles port forwarding via `pelagos run -p`.)
 | Issue | Status | Fix version |
 |---|---|---|
 | pelagos#120 — `/etc/hosts` absent | **CLOSED** | pelagos v0.57.0 |
-| pelagos-mac exec stdin BufReader | **Applied** (not merged) | branch fix/devcontainer-suite-isolation |
+| pelagos-mac exec stdin BufReader | **CLOSED** | branch fix/devcontainer-suite-isolation |
+| pelagos#TBD — exec-into missing PID namespace join | **OPEN — CURRENT BLOCKER** | TBD |
+
+### Current Blocker: exec-into PID namespace (pelagos#TBD)
+
+VS Code's `resolveAuthority` runs `aT()` which proc-scans the container and ends with
+`readlink /proc/self/ns/mnt 2>/dev/null`. This fails in pelagos containers because
+exec-into processes are **not in the container's PID namespace**:
+
+```bash
+# Inside a pelagos container via exec-into:
+ls -la /proc/self   # → 0-byte dangling symlink (points to non-existent /proc/<pid>)
+ls /proc/[0-9]*     # → only /proc/1 (container init), exec'd process invisible
+```
+
+**Why it matters:** `aT()` uses the shell server's `exec()` method. When the command
+exits with code 1, the shell server rejects the promise. This propagates through
+`Ioe()` → `Rl()` → `resolveAuthority()`, which fails with
+`{"code":"NotAvailable","detail":true}` at approximately T+6.8s (before the 8s timeout).
+
+**All other layers work correctly** — the muxrpc protocol, server install, port
+forwarding mechanism via `docker exec` node tunnel — none of this can be reached
+because `resolveAuthority` fails first.
+
+**Fix required in pelagos:** `exec_into` must call `setns(pid_ns_fd, CLONE_NEWPID)`
+before the fork/exec, joining the container's PID namespace so exec'd processes appear
+in `/proc` and `/proc/self` resolves correctly.
 
 ---
 
