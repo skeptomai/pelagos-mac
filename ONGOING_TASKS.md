@@ -1,7 +1,7 @@
 # pelagos-mac — Ongoing Tasks
 
 
-*Last updated: 2026-03-16*
+*Last updated: 2026-03-17*
 
 ---
 
@@ -75,6 +75,19 @@ All Suite C tests now pass (node v24.14.0, npm 11.9.0) with pelagos v0.53.0
 
 Run VS Code "Reopen in Container" against a project with a `.devcontainer/`
 and verify: IDE attaches, extensions install, terminal opens inside container.
+
+**Blockers (in order):**
+
+1. **pelagos#120** — container `/etc/hosts` not created. VS Code server (Node.js)
+   calls `getaddrinfo("localhost")` at startup; fails with `ENOTFOUND`. Server logs
+   the error and VS Code cannot connect. Fix: pelagos must write `/etc/hosts` with
+   `127.0.0.1 localhost` at container creation (same as Docker). Tracked in
+   pelagos-mac#104.
+
+2. **exec-into stdin BufReader fix** (pelagos-mac#103, now CLOSED) — applied in
+   `pelagos-mac/src/main.rs` `exec_command` stdin thread: replaced `io::stdin().read()`
+   with `libc::read(STDIN_FILENO,...)`. Both `dd` transfers now complete instantly
+   (74 MB in 1.3 s, 6.8 KB in 16 µs). Needs to be committed and merged.
 
 ### pelagos-mac — Lower priority
 
