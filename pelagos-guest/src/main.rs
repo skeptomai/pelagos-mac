@@ -305,6 +305,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
         };
         match cmd {
             GuestCommand::Ping => {
+                log::debug!("ping");
                 send_response(&mut writer, &GuestResponse::Pong { pong: true })?;
                 return Ok(());
             }
@@ -348,6 +349,7 @@ fn handle_connection(fd: libc::c_int) -> std::io::Result<()> {
                 return Ok(());
             }
             GuestCommand::Ps { all } => {
+                log::debug!("ps all={}", all);
                 let mut cmd = Command::new(pelagos_bin());
                 cmd.arg("ps");
                 if all {

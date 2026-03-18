@@ -1,7 +1,7 @@
 # pelagos-mac — Ongoing Tasks
 
 
-*Last updated: 2026-03-18 (commit cd7ac42)*
+*Last updated: 2026-03-18 (branch fix/devcontainer-suite-isolation)*
 
 ---
 
@@ -29,7 +29,7 @@ is ready for manual verification (PR #106).
 | `pelagos run --detach --name` | ✅ | PR #37 |
 | `pelagos vm shell` | ✅ | PR #45 |
 | Busybox applet symlinks in VM | ✅ | PR #47 |
-| Persistent OCI image cache (`/dev/vda` ext2) | ✅ | PR #50 |
+| Persistent OCI image cache (`/dev/vda` ext4) | ✅ | PR #50 |
 | ECR Public test image (no rate limits) | ✅ | PR #50 |
 | devpts mount + PTY job control | ✅ | PR #38/#40 |
 | `pelagos vm console` (hvc0 serial) | ✅ | PR #51 |
