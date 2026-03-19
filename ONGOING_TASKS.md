@@ -1,19 +1,19 @@
 # pelagos-mac — Ongoing Tasks
 
 
-*Last updated: 2026-03-19 (branch feat/native-pid-namespace-exec, PR #107; pelagos v0.59.0)*
+*Last updated: 2026-03-19 (branch fix/devcontainer-suite-isolation; pelagos v0.59.0)*
 
 ---
 
 ## Current State
 
 **Phase 4 (VS Code devcontainer support) complete.** The Docker CLI shim covers
-the full devcontainer lifecycle. The exec-into PID namespace blocker
-(pelagos#121) is fixed in pelagos-guest using a hybrid nsenter approach.
+the full devcontainer lifecycle. The exec-into `/proc/self` blocker is fixed in
+pelagos-guest via `unshare(CLONE_NEWNS)` + `/proc` remount in exec-into grandchild.
 The "Dev container not found" blocker (shim inspect after exit) is fixed via
 a local container state cache in pelagos-docker.
 All 22 devcontainer e2e tests (Suites A–E) pass. VS Code "Reopen in Container"
-is ready for manual verification (PR #106).
+ready for manual verification.
 
 ### What works today
 
@@ -81,21 +81,25 @@ and verify: IDE attaches, extensions install, terminal opens inside container.
 2. **exec-into stdin BufReader fix** (pelagos-mac#103) — CLOSED. Applied in
    `pelagos-mac/src/main.rs`: replaced `io::stdin().read()` with `libc::read(STDIN_FILENO,...)`.
 
-3. **pelagos#121 — exec-into PID namespace join.** **FIXED in PR #106.**
-   Root cause: `setns(CLONE_NEWPID)` in `pre_exec` (after fork) only sets
-   `pid_for_children`; a second fork is required for the process to acquire a
-   namespace-local PID. Without it, `/proc/self` is a dangling symlink, causing
-   VS Code `resolveAuthority` to fail.
+3. **exec-into `/proc/self` dangling symlink** — **FIXED (this branch).**
+   Root cause: pelagos does NOT create a separate PID namespace for containers.
+   The exec'd process gets a VM-level PID (e.g., 879) that doesn't exist in the
+   container's filtered `/proc` view, making `/proc/self` a dangling symlink.
+   VS Code's node server uses `/proc/self/exe` and `/proc/self/fd/` heavily;
+   the dangling symlink caused `resolveAuthority` to fail.
 
    **Fix (pelagos-guest/src/main.rs `handle_exec_into`):**
-   - `pre_exec` joins net/uts/ipc/mnt namespaces and fchdir+chroots into container rootfs.
-   - The command is wrapped: `nsenter --target 1 --pid -- <prog> <args>`. After chroot,
-     `/proc` is the container's procfs; nsenter performs the correct double-fork from
-     a single-threaded context, giving the exec'd process a container-local PID.
-   - `nsenter` (util-linux) is staged into the initramfs from Alpine's
-     `util-linux-misc-2.40.4-r1.apk`.
+   - Intermediate child calls `unshare(CLONE_NEWNS)` after joining the container's
+     mnt namespace and chrooting. This creates a private copy of the mnt namespace
+     so subsequent mounts don't affect the container's original `/proc`.
+   - Grandchild remounts `/proc` fresh (`mount("proc", "/proc", "proc", ...)`)
+     before exec. The fresh procfs reflects the current PID namespace (VM root),
+     so `/proc/self` → `/proc/<grandchild-vm-pid>` is valid.
+   - The `setns_pid` + double-fork is kept for future pelagos PID namespace support;
+     if pelagos adds `CLONE_NEWPID` the grandchild will get a container-local PID
+     and the fresh `/proc` will show that PID correctly.
 
-   **Verified:** `mypid=2`, `readlink /proc/self/ns/mnt` → `mnt:[4026532138]`, exit 0.
+   **Verified:** `/proc/self/ns/pid` resolves, `/proc/$$/exe` → `/usr/bin/dash`, exit 0.
 
 5. **pelagos#124 — `pelagos run` must persist container PID before relaying stdout.**
    **FIXED in pelagos v0.59.0 (PR #125).** Integrated in pelagos-mac (PELAGOS_VERSION bumped

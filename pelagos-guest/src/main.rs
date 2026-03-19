@@ -1624,10 +1624,22 @@ fn handle_exec_into(
             }
             unsafe { libc::close(root_fd) };
 
+            // Unshare the mount namespace so that the /proc remount in the grandchild
+            // does not affect the container's own /proc view.  pelagos does not (yet)
+            // create a separate PID namespace for containers, so the exec'd process
+            // gets a VM-level PID.  A fresh /proc mount makes /proc/self valid for
+            // that PID.  When pelagos adds PID namespace support the setns_pid +
+            // double-fork below will give the grandchild a container-local PID, and
+            // the /proc remount will then reflect the container's PID namespace.
+            if unsafe { unshare_newns() } < 0 {
+                unsafe { libc::_exit(126) };
+            }
+
             // Join PID namespace.  setns(CLONE_NEWPID) updates pid_for_children only;
             // the intermediate itself keeps its old PID.  The next fork() child is
             // born inside the PID namespace.  Requires single-threaded process —
             // guaranteed: fork() delivers only the calling thread to the child.
+            // If pelagos does not use a separate PID namespace this is a no-op.
             if unsafe { setns_pid(ns_fds[3]) } < 0 {
                 unsafe { libc::_exit(126) };
             }
@@ -1639,6 +1651,11 @@ fn handle_exec_into(
                 -1 => unsafe { libc::_exit(126) },
                 0 => {
                     // ── GRANDCHILD ───────────────────────────────────────────
+                    // Remount /proc so that /proc/self resolves to our PID.
+                    // The intermediate did unshare(CLONE_NEWNS) so this mount
+                    // does not affect the container's original /proc.  The
+                    // mount syscall is async-signal-safe and safe post-fork.
+                    unsafe { remount_proc() };
                     // Close fds the exec'd program must not inherit.
                     // Pipes have O_CLOEXEC (closed at exec), but we close them
                     // explicitly so fds are dropped before exec, not after.
@@ -1797,6 +1814,41 @@ unsafe fn setns_pid(fd: libc::c_int) -> libc::c_int {
 #[cfg(not(target_os = "linux"))]
 unsafe fn setns_pid(_fd: libc::c_int) -> libc::c_int {
     panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// `unshare(2)` with `CLONE_NEWNS`: create a private mount namespace.
+/// After this call, mount/umount operations in the current process do not
+/// propagate back to the parent namespace.
+/// async-signal-safe: safe to call in a forked child.
+#[cfg(target_os = "linux")]
+unsafe fn unshare_newns() -> libc::c_int {
+    libc::unshare(libc::CLONE_NEWNS)
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn unshare_newns() -> libc::c_int {
+    panic!("unshare is Linux-only; pelagos-guest only runs inside the Linux VM")
+}
+
+/// Remount `/proc` as a fresh procfs so that `/proc/self` resolves to the
+/// calling process's PID.  Must be called after `unshare_newns()` to avoid
+/// affecting the container's original `/proc` mount.
+/// async-signal-safe: `libc::mount` is a raw syscall wrapper.
+#[cfg(target_os = "linux")]
+unsafe fn remount_proc() {
+    // MS_NOSUID | MS_NODEV | MS_NOEXEC are standard proc mount flags.
+    libc::mount(
+        b"proc\0".as_ptr() as *const libc::c_char,
+        b"/proc\0".as_ptr() as *const libc::c_char,
+        b"proc\0".as_ptr() as *const libc::c_char,
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        std::ptr::null(),
+    );
+    // Ignore errors: if /proc doesn't exist in this container rootfs the
+    // exec will still work, just without a valid /proc/self.
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn remount_proc() {
+    panic!("mount is Linux-only; pelagos-guest only runs inside the Linux VM")
 }
 
 /// `execvpe(2)`: exec with explicit envp, searching PATH for bare filenames.
