@@ -864,9 +864,18 @@ fn cmd_rm(cfg: &Config, force: bool, name: &str) -> i32 {
 
 /// Call `pelagos inspect <name>` and return the parsed JSON value.
 /// The host `pelagos inspect` delegates to `pelagos container inspect` in the guest.
-/// Returns None if the container is not found or the command fails.
+/// Returns None if the container is not found, the command fails, or it times out.
+///
+/// A 2-second timeout guards against broken/stale containers: `pelagos inspect`
+/// should never take more than a few hundred milliseconds on a healthy VM.  If it
+/// does, the container state is unresolvable and the caller gets an empty result
+/// rather than a permanent hang.
 fn pelagos_container_inspect_json(cfg: &Config, name: &str) -> Option<serde_json::Value> {
-    let out = run_pelagos(cfg, &args(&["inspect", name])).ok()?;
+    let out = invoke::run_pelagos_timeout(
+        cfg,
+        &args(&["inspect", name]),
+        std::time::Duration::from_secs(2),
+    )?;
     if !out.status.success() {
         return None;
     }
@@ -943,10 +952,10 @@ fn cmd_ps(cfg: &Config, all: bool, quiet: bool, filters: &[String], format: Opti
     if all {
         sub.push("--all".into());
     }
-    let out = match run_pelagos(cfg, &sub) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("pelagos-docker ps: {}", e);
+    let out = match invoke::run_pelagos_timeout(cfg, &sub, std::time::Duration::from_secs(5)) {
+        Some(o) => o,
+        None => {
+            eprintln!("pelagos-docker ps: timed out (VM not responding)");
             return 1;
         }
     };

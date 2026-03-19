@@ -247,6 +247,15 @@ fn main() {
         let conn_fd = match accept_vsock(&listener) {
             Ok(fd) => fd,
             Err(e) => {
+                // EMFILE/ENFILE: fd table exhausted — back off so we don't
+                // spin hot filling the log while waiting for fds to be freed.
+                if let Some(os_err) = e.raw_os_error() {
+                    if os_err == libc::EMFILE || os_err == libc::ENFILE {
+                        log::warn!("accept: fd table exhausted ({}), backing off", e);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
+                }
                 log::error!("accept failed: {}", e);
                 continue;
             }
@@ -1333,33 +1342,26 @@ fn handle_exec(
     }
 }
 
-/// Exec into an already-running container by entering its Linux namespaces.
+/// Exec into a running container by joining all its Linux namespaces natively.
 ///
-/// Uses a two-step approach to correctly handle the PID namespace:
+/// Uses a double-fork to correctly place the exec'd process inside the container's
+/// PID namespace without depending on the external `nsenter` binary:
 ///
-/// Step 1 (pre_exec, in the forked child): join net/uts/ipc/mnt namespaces,
-/// then fchdir+chroot into the container's rootfs.  After this, the child is
-/// inside the container's mount/network/UTS/IPC namespaces.
+/// - **Parent**: opens namespace fds and root fd, prepares execve arguments, forks.
+/// - **Intermediate** (child): joins net/uts/ipc/mnt namespaces, chroots, calls
+///   `setns(CLONE_NEWPID)` to update `pid_for_children`, then forks again.
+/// - **Grandchild**: born inside the PID namespace (gets a namespace-local PID),
+///   dup2s I/O fds, and execs the target program.
+/// - **Intermediate continues**: waits for grandchild, writes 4-byte exit code to
+///   status pipe, then `_exit(0)`.
+/// - **Parent**: relays I/O via frames, reads exit code from status pipe, sends
+///   `FRAME_EXIT`, then reaps the intermediate.
 ///
-/// Step 2 (nsenter, run as the command): after chroot, `/proc` is the
-/// container's procfs.  `nsenter --target 1 --pid` opens `/proc/1/ns/pid`,
-/// calls `setns(CLONE_NEWPID)` in the single-threaded nsenter process (safe),
-/// and forks — the grandchild is born in the container's PID namespace with a
-/// proper local PID.  Without this step, `/proc/self` is a 0-byte dangling
-/// symlink, causing VS Code `resolveAuthority` to fail.
-///
-/// Why not call `setns(CLONE_NEWPID)` directly in pre_exec?
-/// pre_exec runs after fork, in the child.  The child's PID was already
-/// assigned in the parent's namespace at fork time.  setns only updates
-/// `pid_for_children`; a second fork is required for the child to get a PID
-/// in the new namespace.  nsenter handles this double-fork internally.
-///
-/// Requirement: the container image must have `nsenter` (util-linux) at
-/// `/usr/bin/nsenter`.  Ubuntu ≥ 20.04 and Debian ≥ bullseye ship it by
-/// default.  For images without nsenter, exec-into falls back to the
-/// pre_exec-only path (no PID namespace join; `/proc/self` may dangle).
-///
-/// See docs/GUEST_CONTAINER_EXEC.md for the full namespace join analysis.
+/// Why double-fork: `setns(CLONE_NEWPID)` only updates `pid_for_children`; the
+/// calling process retains its old namespace PID.  Only the immediately subsequent
+/// `fork()` child gets a namespace-local PID.  Without it, `/proc/self` is a
+/// dangling symlink in the container's procfs, which breaks VS Code
+/// `resolveAuthority` and any other tool that reads `/proc/self`.
 fn handle_exec_into(
     fd: libc::c_int,
     container: &str,
@@ -1368,44 +1370,25 @@ fn handle_exec_into(
     tty: bool,
     workdir: Option<&str>,
 ) -> std::io::Result<()> {
-    let pid = get_container_pid(container).map_err(|e| {
+    log::info!(
+        "exec-into: container={} tty={} args={:?}",
+        container,
+        tty,
+        args
+    );
+    if args.is_empty() {
         let mut w = FdWriter(fd);
         let _ = send_response(
             &mut w,
             &GuestResponse::Error {
-                error: format!("exec-into: {}", e),
+                error: "exec-into: no command".into(),
             },
         );
-        e
-    })?;
-
-    // Open namespace fds for non-PID namespaces.  PID namespace is handled by
-    // nsenter (which must fork after setns to give the child a namespace-local PID).
-    let ns_fds = open_ns_fds_no_pid(pid).map_err(|e| {
-        let mut w = FdWriter(fd);
-        let _ = send_response(
-            &mut w,
-            &GuestResponse::Error {
-                error: format!("exec-into: open ns fds: {}", e),
-            },
-        );
-        e
-    })?;
-
-    // Open /proc/<pid>/root for fchdir+chroot in pre_exec.
-    let root_fd = open_root_fd(pid).map_err(|e| {
-        for &nfd in &ns_fds {
-            unsafe { libc::close(nfd) };
-        }
-        let mut w = FdWriter(fd);
-        let _ = send_response(
-            &mut w,
-            &GuestResponse::Error {
-                error: format!("exec-into: open root fd: {}", e),
-            },
-        );
-        e
-    })?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "exec-into: no command",
+        ));
+    }
 
     // Send ready — both sides switch to framed binary protocol.
     {
@@ -1413,103 +1396,28 @@ fn handle_exec_into(
         send_response(&mut w, &GuestResponse::Ready { ready: true })?;
     }
 
-    let (prog, rest) = match args.split_first() {
-        Some(p) => p,
-        None => {
-            for nfd in ns_fds {
-                unsafe { libc::close(nfd) };
-            }
-            unsafe { libc::close(root_fd) };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "exec-into: no command",
-            ));
-        }
-    };
-
-    // Build the child environment: start from the container's init process
-    // environment (which carries the OCI image's configured ENV, including PATH),
-    // then overlay caller-supplied overrides.  env_clear() prevents the Alpine
-    // guest environment from leaking through.
-    let mut container_env = read_container_environ(pid);
-    log::debug!(
-        "exec-into: container={} pid={} root_pid={} container_env_keys={} PATH={:?}",
-        container,
-        pid,
-        find_root_pid(pid),
-        container_env.len(),
-        container_env.get("PATH")
-    );
+    // Delegate to `pelagos exec-into` which correctly enters all container
+    // namespaces (net, uts, ipc, mnt, pid) as of pelagos v0.58.0.
+    let pelagos = pelagos_bin();
+    let mut cmd = Command::new(&pelagos);
+    cmd.arg("exec");
+    if tty {
+        cmd.arg("--interactive");
+    }
+    if let Some(w) = workdir {
+        cmd.arg("--workdir").arg(w);
+    }
     for (k, v) in env {
-        container_env.insert(k.clone(), v.clone());
+        cmd.arg("--env").arg(format!("{}={}", k, v));
     }
+    cmd.arg(container);
+    cmd.args(args);
 
-    log::debug!(
-        "exec-into: prog={:?} args={:?} final_env_keys={}",
-        prog,
-        rest,
-        container_env.len()
-    );
-
-    // nsenter wraps the target command to join the PID namespace via double-fork.
-    // After pre_exec chroots us into the container's rootfs, `/proc` is the
-    // container's procfs, so --target 1 refers to the container's init process.
-    let mut cmd = Command::new("/usr/bin/nsenter");
-    cmd.args(["--target", "1", "--pid", "--"]);
-    cmd.arg(prog);
-    cmd.args(rest);
-    cmd.env_clear();
-    for (k, v) in &container_env {
-        cmd.env(k, v);
-    }
-
-    // Enter non-PID namespaces in the child after fork, before exec.
-    // Order: net/uts/ipc first, then mnt (so /proc transitions to container's view).
-    // After setns(mnt), fchdir+chroot into the container's rootfs and chdir to workdir.
-    let workdir_owned: Option<std::ffi::CString> =
-        workdir.and_then(|w| std::ffi::CString::new(w.as_bytes()).ok());
-    unsafe {
-        cmd.pre_exec(move || {
-            for &ns_fd in &ns_fds {
-                if call_setns(ns_fd) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                libc::close(ns_fd);
-            }
-            // Anchor root dentry to the container rootfs.
-            if libc::fchdir(root_fd) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::chroot(c".".as_ptr()) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // chdir to the requested working directory (Docker exec -w), or / by default.
-            let dir_ptr = match workdir_owned.as_ref() {
-                Some(cstr) => cstr.as_ptr(),
-                None => c"/".as_ptr(),
-            };
-            if libc::chdir(dir_ptr) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::close(root_fd);
-            Ok(())
-        });
-    }
-
-    // Spawn and run; parent closes its copies of ns_fds and root_fd after spawn.
-    let result = if tty {
+    if tty {
         handle_exec_tty(fd, cmd)
     } else {
         handle_exec_piped(fd, cmd)
-    };
-
-    // Close parent copies (child already closed its copies in pre_exec).
-    for &ns_fd in &ns_fds {
-        unsafe { libc::close(ns_fd) };
     }
-    unsafe { libc::close(root_fd) };
-
-    result
 }
 
 /// Parse `pelagos ps --all` output and return the PID of the named container.
@@ -1556,48 +1464,6 @@ unsafe fn call_setns(fd: libc::c_int) -> libc::c_int {
 #[cfg(not(target_os = "linux"))]
 unsafe fn call_setns(_fd: libc::c_int) -> libc::c_int {
     panic!("setns is Linux-only; pelagos-guest only runs inside the Linux VM")
-}
-
-/// Read the environment of the container's root process from `/proc/<pid>/environ`.
-///
-/// Uses `find_root_pid` so we read from the process that actually called
-/// `pivot_root` (and therefore has the container's OCI-configured ENV).
-/// Returns an empty map on any read/parse failure — callers treat it as
-/// best-effort.
-fn read_container_environ(pid: u32) -> std::collections::HashMap<String, String> {
-    let root_pid = find_root_pid(pid);
-    let path = format!("/proc/{}/environ", root_pid);
-    let mut map = std::collections::HashMap::new();
-    match std::fs::read(&path) {
-        Ok(data) => {
-            for entry in data.split(|&b| b == 0) {
-                if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
-                    let key = String::from_utf8_lossy(&entry[..eq_pos]).into_owned();
-                    let val = String::from_utf8_lossy(&entry[eq_pos + 1..]).into_owned();
-                    if !key.is_empty() {
-                        map.insert(key, val);
-                    }
-                }
-            }
-            log::debug!(
-                "read_container_environ: pid={} root_pid={} read {} bytes → {} vars",
-                pid,
-                root_pid,
-                data.len(),
-                map.len()
-            );
-        }
-        Err(e) => {
-            log::warn!(
-                "read_container_environ: pid={} root_pid={} failed to read {}: {}",
-                pid,
-                root_pid,
-                path,
-                e
-            );
-        }
-    }
-    map
 }
 
 /// Resolve the PID that actually called `pivot_root` for the container.
@@ -1660,30 +1526,6 @@ fn open_root_fd(pid: u32) -> std::io::Result<libc::c_int> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(fd)
-}
-
-/// Open namespace file descriptors for the given PID.
-/// Returns fds in order: [net, uts, ipc, pid, mnt].
-/// Caller must close all returned fds.
-/// Open namespace fds for exec-into: net/uts/ipc/mnt only (no pid).
-/// The PID namespace is handled by nsenter (double-fork in nsenter process).
-fn open_ns_fds_no_pid(pid: u32) -> std::io::Result<[libc::c_int; 4]> {
-    let ns_names = ["net", "uts", "ipc", "mnt"];
-    let mut fds = [-1i32; 4];
-    for (i, ns) in ns_names.iter().enumerate() {
-        let path = format!("/proc/{}/ns/{}", pid, ns);
-        let cpath = std::ffi::CString::new(path.as_str())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if fd < 0 {
-            for fd in fds.iter().take(i) {
-                unsafe { libc::close(*fd) };
-            }
-            return Err(std::io::Error::last_os_error());
-        }
-        fds[i] = fd;
-    }
-    Ok(fds)
 }
 
 fn open_ns_fds(pid: u32) -> std::io::Result<[libc::c_int; 5]> {
