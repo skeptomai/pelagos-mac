@@ -220,6 +220,15 @@ enum Commands {
         #[arg(short = 'p', long = "port")]
         ports: Vec<String>,
     },
+
+    /// Internal: SSH ProxyCommand helper — connects stdin/stdout to a VM port
+    /// via the smoltcp NAT relay proxy. Used by `pelagos vm ssh`. Not for
+    /// direct use.
+    #[command(hide = true)]
+    SshRelayProxy {
+        /// VM port to connect to (e.g. 22 for SSH).
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -515,6 +524,15 @@ fn main() {
                 );
                 process::exit(1);
             }
+            // Route SSH through the smoltcp relay proxy — the host has no
+            // direct route to 192.168.105.2, but the relay proxy at
+            // 127.0.0.1:RELAY_PROXY_PORT can forward TCP to any VM port.
+            // We use ourselves as the ProxyCommand so no external tools are needed.
+            let exe = std::env::current_exe().unwrap_or_else(|_| {
+                eprintln!("error: cannot determine current executable path");
+                process::exit(1);
+            });
+            let proxy_cmd = format!("{} ssh-relay-proxy 22", exe.display());
             let mut cmd = std::process::Command::new("ssh");
             cmd.arg("-i")
                 .arg(&ssh_key)
@@ -524,7 +542,9 @@ fn main() {
                 .arg("UserKnownHostsFile=/dev/null")
                 .arg("-o")
                 .arg("LogLevel=ERROR")
-                .arg("root@192.168.105.2");
+                .arg("-o")
+                .arg(format!("ProxyCommand={}", proxy_cmd))
+                .arg("root@vm"); // hostname is arbitrary; ProxyCommand handles routing
             for arg in &extra {
                 cmd.arg(arg);
             }
@@ -898,6 +918,10 @@ fn main() {
         Commands::PortProxy { ref ports } => {
             cmd_port_proxy(ports);
         }
+
+        Commands::SshRelayProxy { port } => {
+            ssh_relay_proxy(port);
+        }
     }
 }
 
@@ -925,6 +949,46 @@ fn cmd_port_proxy(ports: &[String]) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(86400));
     }
+}
+
+/// SSH ProxyCommand helper: connect stdin/stdout to a VM port via the smoltcp
+/// NAT relay proxy at 127.0.0.1:RELAY_PROXY_PORT.
+///
+/// Protocol: connect → write 2-byte big-endian port number → raw stream.
+/// SSH invokes this as a subprocess and speaks SSH protocol over its stdio.
+fn ssh_relay_proxy(port: u16) -> ! {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    const RELAY_PROXY_PORT: u16 = pelagos_vz::nat_relay::RELAY_PROXY_PORT;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
+    let mut relay = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
+        .unwrap_or_else(|e| {
+            eprintln!("ssh-relay-proxy: connect relay: {}", e);
+            process::exit(1);
+        });
+
+    // Send the 2-byte big-endian target port inside the VM.
+    relay.write_all(&port.to_be_bytes()).unwrap_or_else(|e| {
+        eprintln!("ssh-relay-proxy: write port: {}", e);
+        process::exit(1);
+    });
+
+    // Proxy stdin → relay and relay → stdout in two threads.
+    let relay_read = relay.try_clone().expect("clone relay");
+    let t1 = std::thread::spawn(move || {
+        let mut src = std::io::stdin().lock();
+        let mut dst = relay;
+        let _ = std::io::copy(&mut src, &mut dst);
+    });
+    let t2 = std::thread::spawn(move || {
+        let mut src = relay_read;
+        let mut dst = std::io::stdout().lock();
+        let _ = std::io::copy(&mut src, &mut dst);
+    });
+    let _ = t1.join();
+    let _ = t2.join();
+    process::exit(0);
 }
 
 fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
