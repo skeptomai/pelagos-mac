@@ -713,6 +713,10 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
+            let profile_cfg = state::VmProfileConfig::load(&profile).unwrap_or_default();
+            if profile_cfg.ping_mode == state::PingMode::Ssh {
+                process::exit(ping_ssh(&cli));
+            }
             let stream = connect_or_exit(&profile);
             process::exit(ping_command(stream));
         }
@@ -1775,6 +1779,65 @@ fn ping_command(stream: UnixStream) -> i32 {
             log::error!("unexpected ping response: {:?}", other);
             1
         }
+    }
+}
+
+/// Ping a non-pelagos VM (e.g. Ubuntu build VM) by waiting for SSH to respond.
+/// The daemon is already running when this is called; we just retry SSH until
+/// it accepts a connection, then print "pong".  Retries for up to 5 minutes.
+fn ping_ssh(cli: &Cli) -> i32 {
+    let profile = &cli.profile;
+    let ssh_key = match state::global_ssh_key_file() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("SSH key: {}", e);
+            return 1;
+        }
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("current_exe: {}", e);
+            return 1;
+        }
+    };
+    let proxy_cmd = format!(
+        "{} --profile {} ssh-relay-proxy {}",
+        exe.display(),
+        profile,
+        VM_SSH_PORT
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let ok = std::process::Command::new("ssh")
+            .arg("-i")
+            .arg(&ssh_key)
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("ConnectTimeout=5")
+            .arg("-o")
+            .arg(format!("ProxyCommand={}", proxy_cmd))
+            .arg("root@vm")
+            .arg("true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            println!("pong");
+            return 0;
+        }
+        if std::time::Instant::now() >= deadline {
+            log::error!("SSH ping timed out after 5 minutes");
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }
 

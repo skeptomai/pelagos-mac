@@ -366,11 +366,12 @@ mkdir -p "$PROFILE_STATE_DIR"
 cat > "$PROFILE_STATE_DIR/vm.conf" << VMCONF_EOF
 # vm.conf — auto-written by build-build-image.sh
 # Profile: $PROFILE
-disk   = $BUILD_IMG
-kernel = $KERNEL
-initrd = $INITRD
-memory = $MEMORY_MIB
-cpus   = $CPUS
+disk      = $BUILD_IMG
+kernel    = $KERNEL
+initrd    = $INITRD
+memory    = $MEMORY_MIB
+cpus      = $CPUS
+ping_mode = ssh
 VMCONF_EOF
 
 echo "  $PROFILE_STATE_DIR/vm.conf"

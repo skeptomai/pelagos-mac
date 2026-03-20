@@ -66,6 +66,24 @@ make build-guest
 The guest is built as a static musl binary (`aarch64-unknown-linux-musl`) and baked
 into the VM image by `build-vm-image.sh`.
 
+## VM profiles
+
+Named profiles run different VM configurations from the same binary. The
+default profile runs the Alpine pelagos VM for containers. The `build` profile
+runs an Ubuntu 22.04 VM for native aarch64 development:
+
+```bash
+bash scripts/build-build-image.sh   # provision Ubuntu build VM (one-time)
+bash scripts/build-vm-start.sh      # start it and wait for SSH
+pelagos --profile build vm ssh      # connect
+pelagos --profile build vm ssh -- rustc --version
+```
+
+The key distinction: the Alpine VM uses **vsock → pelagos-guest** as its
+control plane (for container commands). The Ubuntu build VM uses
+**SSH → openssh-server**. `pelagos ping` handles both via `ping_mode` in
+`vm.conf` — see [docs/VM_LIFECYCLE.md](docs/VM_LIFECYCLE.md#vm-profiles-and-control-planes).
+
 ## Using with VS Code Dev Containers
 
 Set the Docker executable in VS Code settings:

@@ -35,6 +35,16 @@ pub struct StateDir {
 /// memory = 4096
 /// cpus   = 4
 /// ```
+/// How `pelagos ping` checks VM readiness.
+#[derive(Debug, Default, PartialEq, Clone)]
+pub enum PingMode {
+    /// Send a vsock ping to pelagos-guest (Alpine / container VM). Default.
+    #[default]
+    Vsock,
+    /// Wait for SSH to be available (Ubuntu / non-pelagos OS profiles).
+    Ssh,
+}
+
 #[derive(Debug, Default)]
 pub struct VmProfileConfig {
     pub disk: Option<PathBuf>,
@@ -42,6 +52,8 @@ pub struct VmProfileConfig {
     pub initrd: Option<PathBuf>,
     pub memory: Option<usize>,
     pub cpus: Option<usize>,
+    /// How `pelagos ping` checks VM readiness. Default: `vsock`.
+    pub ping_mode: PingMode,
 }
 
 impl VmProfileConfig {
@@ -75,6 +87,12 @@ impl VmProfileConfig {
                 "initrd" => cfg.initrd = Some(PathBuf::from(val)),
                 "memory" => cfg.memory = val.parse::<usize>().ok(),
                 "cpus" => cfg.cpus = val.parse::<usize>().ok(),
+                "ping_mode" => {
+                    cfg.ping_mode = match val {
+                        "ssh" => PingMode::Ssh,
+                        _ => PingMode::Vsock,
+                    }
+                }
                 _ => {}
             }
         }
