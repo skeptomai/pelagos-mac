@@ -24,6 +24,11 @@ mod state;
 #[derive(Parser)]
 #[command(name = "pelagos", about = "pelagos container runtime for macOS")]
 struct Cli {
+    /// VM profile name (default: "default"). Named profiles use isolated state
+    /// directories at ~/.local/share/pelagos/profiles/<name>/.
+    #[arg(long, default_value = "default", global = true)]
+    profile: String,
+
     /// Path to the VM kernel image
     #[arg(long, env = "PELAGOS_KERNEL")]
     kernel: Option<PathBuf>,
@@ -413,6 +418,7 @@ fn recv_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
+    let profile = cli.profile.clone();
 
     match cli.command {
         Commands::VmDaemonInternal => {
@@ -422,10 +428,10 @@ fn main() {
 
         Commands::Vm {
             sub: VmCommands::Stop,
-        } => vm_stop(),
+        } => vm_stop(&profile),
         Commands::Vm {
             sub: VmCommands::Status,
-        } => vm_status(),
+        } => vm_status(&profile),
         Commands::Vm {
             sub: VmCommands::Shell,
         } => {
@@ -435,7 +441,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(exec_command(stream, GuestCommand::Shell { tty }, tty));
         }
 
@@ -447,7 +453,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -479,7 +485,7 @@ fn main() {
             sub: VmCommands::Ssh { ref extra },
         } => {
             let extra = extra.clone();
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -585,7 +591,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Run {
@@ -616,7 +622,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(exec_command(
                 stream,
                 GuestCommand::Exec {
@@ -649,7 +655,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(exec_command(
                 stream,
                 GuestCommand::ExecInto {
@@ -669,7 +675,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(ping_command(stream));
         }
 
@@ -679,7 +685,7 @@ fn main() {
             // mounts), just connect and ask.  This allows `docker ps` (called by
             // the devcontainer CLI) to return empty before the container is started
             // without triggering a "different mount configuration" error.
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open state dir: {}", e);
@@ -690,7 +696,7 @@ fn main() {
                 // No daemon = no containers.
                 process::exit(0);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(stream, GuestCommand::Ps { all }));
         }
 
@@ -701,7 +707,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Logs { name, follow },
@@ -715,7 +721,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::ContainerInspect { name },
@@ -729,7 +735,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(stream, GuestCommand::Start { name }));
         }
 
@@ -740,7 +746,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(stream, GuestCommand::Stop { name }));
         }
 
@@ -751,7 +757,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Rm { name, force },
@@ -775,7 +781,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(build_command(
                 stream,
                 &tag,
@@ -791,7 +797,7 @@ fn main() {
             let name = name.clone();
             // If no daemon is running there are no volumes.  Return immediately
             // so devcontainer pre-flight checks don't trigger a full VM boot.
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open state dir: {}", e);
@@ -816,7 +822,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Volume { sub, name },
@@ -828,7 +834,7 @@ fn main() {
             let args = args.clone();
             // Same early-return pattern as Volume: pre-flight network checks
             // should not boot the VM when no daemon is running.
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open state dir: {}", e);
@@ -853,7 +859,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Network { sub, args },
@@ -866,7 +872,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             // One of src/dst must be `container:path`; the other is a local path.
             if let Some((container, src_path)) = parse_container_path(src) {
                 let local_dst = dst.as_str();
@@ -922,9 +928,9 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         process::exit(1);
     });
 
-    // Always-on volumes share: ~/.local/share/pelagos/volumes → /var/lib/pelagos/volumes in VM.
+    // Always-on volumes share: <profile-dir>/volumes → /var/lib/pelagos/volumes in VM.
     // This makes named pelagos volumes persistent across VM restarts (virtiofs-backed on host).
-    let volumes_host = pelagos_volumes_host_path();
+    let volumes_host = pelagos_volumes_host_path(&cli.profile);
     if let Err(e) = std::fs::create_dir_all(&volumes_host) {
         log::warn!(
             "could not create volumes directory {}: {}",
@@ -993,17 +999,19 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         cpus: cli.cpus,
         virtiofs_shares,
         port_forwards,
+        profile: cli.profile.clone(),
     }
 }
 
-/// Returns `~/.local/share/pelagos/volumes`, the host-side backing directory for
-/// the always-on `pelagos-volumes` virtiofs share.
-fn pelagos_volumes_host_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("pelagos")
+/// Returns the host-side backing directory for the always-on `pelagos-volumes`
+/// virtiofs share.  For the default profile this is `~/.local/share/pelagos/volumes`;
+/// for named profiles it is `~/.local/share/pelagos/profiles/<name>/volumes`.
+fn pelagos_volumes_host_path(profile: &str) -> PathBuf {
+    state::profile_dir(profile)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".local/share/pelagos")
+        })
         .join("volumes")
 }
 
@@ -1112,8 +1120,8 @@ fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
         .collect()
 }
 
-fn connect_or_exit() -> UnixStream {
-    daemon::connect().unwrap_or_else(|e| {
+fn connect_or_exit(profile: &str) -> UnixStream {
+    daemon::connect(profile).unwrap_or_else(|e| {
         log::error!("connect to VM daemon: {}", e);
         process::exit(1);
     })
@@ -1123,8 +1131,8 @@ fn connect_or_exit() -> UnixStream {
 // VM management commands
 // ---------------------------------------------------------------------------
 
-fn vm_stop() {
-    let state = state::StateDir::open().unwrap_or_else(|e| {
+fn vm_stop(profile: &str) {
+    let state = state::StateDir::open_profile(profile).unwrap_or_else(|e| {
         log::error!("state dir: {}", e);
         process::exit(1);
     });
@@ -1151,8 +1159,8 @@ fn vm_stop() {
     }
 }
 
-fn vm_status() {
-    let state = state::StateDir::open().unwrap_or_else(|e| {
+fn vm_status(profile: &str) {
+    let state = state::StateDir::open_profile(profile).unwrap_or_else(|e| {
         log::error!("state dir: {}", e);
         process::exit(1);
     });

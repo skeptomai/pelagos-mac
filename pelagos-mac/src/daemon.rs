@@ -91,6 +91,8 @@ pub struct DaemonArgs {
     pub virtiofs_shares: Vec<VirtiofsShare>,
     /// Host→container port forwards (may be empty).
     pub port_forwards: Vec<PortForward>,
+    /// VM profile name ("default" or a named profile).
+    pub profile: String,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
@@ -99,7 +101,7 @@ pub struct DaemonArgs {
 /// If the daemon is already running but was started with a different mount
 /// configuration, returns an error asking the user to run `pelagos vm stop`.
 pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
-    let state = StateDir::open()?;
+    let state = StateDir::open_profile(&args.profile)?;
 
     if state.is_daemon_alive() {
         // Verify that the running daemon was started with the same mounts.
@@ -138,6 +140,9 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
+    if args.profile != "default" {
+        cmd.arg("--profile").arg(&args.profile);
+    }
     cmd.arg("--kernel").arg(&args.kernel);
     cmd.arg("--disk").arg(&args.disk);
     if let Some(ref initrd) = args.initrd {
@@ -195,9 +200,9 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
     }
 }
 
-/// Connect to the running daemon's Unix socket.
-pub fn connect() -> io::Result<UnixStream> {
-    let state = StateDir::open()?;
+/// Connect to the running daemon's Unix socket for the given profile.
+pub fn connect(profile: &str) -> io::Result<UnixStream> {
+    let state = StateDir::open_profile(profile)?;
     UnixStream::connect(&state.sock_file)
         .map_err(|e| io::Error::new(e.kind(), format!("daemon connect: {}", e)))
 }
@@ -205,7 +210,7 @@ pub fn connect() -> io::Result<UnixStream> {
 /// Entry point for the `vm-daemon-internal` subcommand.
 /// Boots the VM, serves vsock connections, and never returns.
 pub fn run(args: DaemonArgs) -> ! {
-    let state = StateDir::open().expect("state dir");
+    let state = StateDir::open_profile(&args.profile).expect("state dir");
 
     // Guard against two daemons racing.
     if state.is_daemon_alive() {
