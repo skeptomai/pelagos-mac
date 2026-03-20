@@ -11,10 +11,17 @@
 #   pelagos --profile <name> ping
 # boots the Ubuntu VM without extra flags.
 #
+# I/O design (Alternative A):
+#   build.img is passed as a second virtio-blk device (--extra-disk) to the
+#   Alpine provisioning VM, appearing as /dev/vdb.  All provisioning I/O goes
+#   directly block → ext4 with no FUSE/virtiofs in the path.  The virtiofs
+#   volumes share is used only for the small provisioning script.
+#
 # Requirements:
-#   - Alpine VM already running: bash scripts/vm-ping.sh
+#   - Alpine VM NOT running (this script stops and restarts it temporarily)
 #   - out/vmlinuz, out/initramfs-custom.gz must exist
 #   - scripts/build-vm-image.sh must have been run (stages loop.ko)
+#   - pelagos release binary built and signed
 #
 # Usage:
 #   bash scripts/build-build-image.sh [--profile <name>] [--memory <mib>] [--cpus <n>]
@@ -45,9 +52,9 @@ DISK_SIZE_GB=20
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --profile)   PROFILE="$2";     shift 2 ;;
-        --memory)    MEMORY_MIB="$2";  shift 2 ;;
-        --cpus)      CPUS="$2";        shift 2 ;;
+        --profile)   PROFILE="$2";      shift 2 ;;
+        --memory)    MEMORY_MIB="$2";   shift 2 ;;
+        --cpus)      CPUS="$2";         shift 2 ;;
         --disk-size) DISK_SIZE_GB="$2"; shift 2 ;;
         *)           echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -76,7 +83,7 @@ UBUNTU_TARBALL_NAME="ubuntu-base-22.04-base-arm64.tar.gz"
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== build-build-image.sh ==="
+echo "=== build-build-image.sh (Alternative A — virtio-blk /dev/vdb) ==="
 echo "  profile:   $PROFILE"
 echo "  output:    $BUILD_IMG"
 echo "  memory:    ${MEMORY_MIB} MiB"
@@ -99,26 +106,55 @@ if [[ ! -f "$SSH_KEY_FILE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Ensure Alpine VM is running
+# Helper: invoke the Alpine VM with the default config.
+# Used for pre-flight ping and for the final normal restart.
 # ---------------------------------------------------------------------------
 
 pelagos_alpine() {
     "$BINARY" --kernel "$KERNEL" --initrd "$INITRD" --disk "$ALPINE_DISK" "$@"
 }
 
-echo "--- pre-flight: Alpine VM ---"
-printf "  pinging Alpine VM... "
-if ! pelagos_alpine ping 2>&1 | grep -q pong; then
-    echo ""
-    echo "ABORT: Alpine VM not running." >&2
-    echo "       Run 'bash scripts/vm-ping.sh' first." >&2
-    exit 1
+# Helper: invoke the Alpine VM with build.img attached as /dev/vdb.
+# Used only during the provisioning session.
+
+pelagos_provision() {
+    "$BINARY" --kernel "$KERNEL" --initrd "$INITRD" --disk "$ALPINE_DISK" \
+        --extra-disk "$BUILD_IMG" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Stop any running Alpine VM daemon so we can restart it with --extra-disk.
+# ---------------------------------------------------------------------------
+
+stop_alpine_vm() {
+    # Terminate the daemon process and remove stale state files.
+    pkill -TERM -f "pelagos.*vm-daemon-internal" 2>/dev/null || true
+    # Give the daemon time to shut down cleanly.
+    sleep 2
+    # Force-kill if still present.
+    pkill -KILL -f "pelagos.*vm-daemon-internal" 2>/dev/null || true
+    rm -f "$PELAGOS_BASE/vm.pid" "$PELAGOS_BASE/vm.sock"
+}
+
+# ---------------------------------------------------------------------------
+# Check whether the Alpine VM is already running, and stop it.
+# We need an exclusive boot to attach --extra-disk.
+# ---------------------------------------------------------------------------
+
+echo "--- stopping Alpine VM (if running) ---"
+if pelagos_alpine ping 2>/dev/null | grep -q pong; then
+    echo "  Alpine VM is running — stopping it for provisioning boot"
+    stop_alpine_vm
+    echo "  stopped"
+else
+    # Ensure any stale pid/sock files are removed.
+    stop_alpine_vm
+    echo "  not running (ok)"
 fi
-echo "ok"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Create the sparse build image on macOS
+# Create the sparse build image on macOS.
 # ---------------------------------------------------------------------------
 
 DISK_SIZE_MB=$((DISK_SIZE_GB * 1024))
@@ -135,63 +171,48 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Copy build.img to the Alpine volumes dir so the VM can see it via virtiofs.
+# Start the Alpine VM with build.img as /dev/vdb.
 # ---------------------------------------------------------------------------
 
-mkdir -p "$ALPINE_VOLUMES_DIR"
-VOLUMES_IMG="$ALPINE_VOLUMES_DIR/build.img"
-
-if [[ "$BUILD_IMG" -ef "$VOLUMES_IMG" ]]; then
-    : # same file (shouldn't happen but be safe)
-elif [[ -f "$VOLUMES_IMG" ]]; then
-    echo "--- $VOLUMES_IMG already present (skipping copy) ---"
+echo "--- booting Alpine VM with --extra-disk (provisioning session) ---"
+printf "  pinging... "
+if ! pelagos_provision ping 2>&1 | grep -q pong; then
     echo ""
-else
-    echo "--- copying build.img to volumes dir for VM access ---"
-    cp "$BUILD_IMG" "$VOLUMES_IMG"
-    echo "  copied to $VOLUMES_IMG"
-    echo ""
+    echo "ABORT: provisioning VM did not respond to ping." >&2
+    exit 1
 fi
+echo "ok"
+echo ""
 
 # ---------------------------------------------------------------------------
-# Write the provisioning script to the volumes dir (visible in VM as
-# /var/lib/pelagos/volumes/provision-build.sh).
+# Write the provisioning script to the volumes dir (virtiofs, small file only).
+# The script itself is tiny; only the build.img I/O avoids virtiofs.
 # ---------------------------------------------------------------------------
 
 PUB_KEY_CONTENT="$(cat "${SSH_KEY_FILE}.pub")"
 
+mkdir -p "$ALPINE_VOLUMES_DIR"
+
 cat > "$ALPINE_VOLUMES_DIR/provision-build.sh" << OUTER_EOF
 #!/bin/sh
 # Provisioning script — runs inside the Alpine VM as root.
-# Executed by build-build-image.sh via pelagos vm ssh.
-# Uses only busybox-compatible commands (no util-linux losetup extensions).
+# build.img is presented as /dev/vdb (virtio-blk); no loop device required.
 set -eux
 
-VOLUMES=/var/lib/pelagos/volumes
-IMG="\$VOLUMES/build.img"
+BLK=/dev/vdb
 MNT=/mnt/build-provision
-LODEV=/dev/loop0
 
-echo "[provision] loading loop module"
-modprobe loop
-# Loop module doesn't auto-create device nodes without udev; create manually.
-mknod "\$LODEV" b 7 0 2>/dev/null || true
-
-# Format the image if it doesn't already have the ubuntu-build label.
-# mke2fs -F operates directly on a regular file — no loop device needed.
-if blkid "\$IMG" 2>/dev/null | grep -q 'LABEL="ubuntu-build"'; then
-    echo "[provision] image already formatted as ubuntu-build — skipping format"
+# Format /dev/vdb if it doesn't already have the ubuntu-build label.
+if blkid "\$BLK" 2>/dev/null | grep -q 'LABEL="ubuntu-build"'; then
+    echo "[provision] /dev/vdb already formatted as ubuntu-build — skipping format"
 else
-    echo "[provision] formatting as ext4 label=ubuntu-build"
-    /sbin/mke2fs -F -t ext4 -L ubuntu-build "\$IMG"
+    echo "[provision] formatting /dev/vdb as ext4 label=ubuntu-build"
+    /sbin/mke2fs -t ext4 -L ubuntu-build "\$BLK"
 fi
 
-# Attach loop device for mounting.
-losetup "\$LODEV" "\$IMG"
-echo "[provision] attached \$LODEV"
-
 mkdir -p "\$MNT"
-mount "\$LODEV" "\$MNT"
+mount "\$BLK" "\$MNT"
+echo "[provision] mounted /dev/vdb at \$MNT"
 
 # ---- Ubuntu base extraction ----
 
@@ -199,20 +220,21 @@ if [ -f "\$MNT/etc/os-release" ]; then
     echo "[provision] Ubuntu base already extracted — skipping download"
 else
     echo "[provision] downloading Ubuntu 22.04 arm64 base tarball"
-    TARBALL="\$VOLUMES/${UBUNTU_TARBALL_NAME}"
+    # Download to /tmp (tmpfs) — tarball is ~30 MB, fits easily in RAM.
+    TARBALL="/tmp/${UBUNTU_TARBALL_NAME}"
     if [ ! -f "\$TARBALL" ]; then
         wget -q -O "\$TARBALL" "${UBUNTU_BASE_URL}" || \
             curl -fsSL -o "\$TARBALL" "${UBUNTU_BASE_URL}"
     fi
     echo "[provision] extracting Ubuntu base"
     tar -xzf "\$TARBALL" -C "\$MNT"
+    rm -f "\$TARBALL"
     echo "[provision] extraction complete"
 fi
 
 # ---- chroot provisioning ----
 
-# Bind-mount kernel filesystems.  Create target dirs first — ubuntu-base
-# includes /proc and /sys but /dev/pts may be absent.
+# Bind-mount kernel filesystems.
 mkdir -p "\$MNT/proc" "\$MNT/sys" "\$MNT/dev" "\$MNT/dev/pts"
 mount -t proc  proc   "\$MNT/proc"
 mount -t sysfs sysfs  "\$MNT/sys"
@@ -269,7 +291,6 @@ printf '%s\n' "${PUB_KEY_CONTENT}" > "\$MNT/root/.ssh/authorized_keys"
 chmod 600 "\$MNT/root/.ssh/authorized_keys"
 
 # Ubuntu default PermitRootLogin is "prohibit-password" (key auth only) — correct.
-# No sshd_config edit needed; just confirm it's not set to "no".
 sed -i 's/^PermitRootLogin no/PermitRootLogin prohibit-password/' "\$MNT/etc/ssh/sshd_config" 2>/dev/null || true
 
 # ---- Rust toolchain ----
@@ -289,7 +310,6 @@ umount "\$MNT/dev"     2>/dev/null || true
 umount "\$MNT/sys"     2>/dev/null || true
 umount "\$MNT/proc"    2>/dev/null || true
 umount "\$MNT"
-losetup -d "\$LODEV"
 rmdir  "\$MNT" 2>/dev/null || true
 
 echo "[provision] done"
@@ -304,32 +324,42 @@ echo ""
 # ---------------------------------------------------------------------------
 
 echo "--- running provisioning script in Alpine VM ---"
-echo "    (this will download Ubuntu and install packages; takes several minutes)"
+echo "    (downloads Ubuntu, installs packages, installs Rust — takes several minutes)"
 echo ""
 
-pelagos_alpine vm ssh -- sh /var/lib/pelagos/volumes/provision-build.sh
+pelagos_provision vm ssh -- sh /var/lib/pelagos/volumes/provision-build.sh
 
 echo ""
 echo "--- provisioning complete ---"
 
-# Clean up the provisioning script and tarball from the volumes dir.
+# Clean up the provisioning script from the volumes dir.
 rm -f "$ALPINE_VOLUMES_DIR/provision-build.sh"
-rm -f "$ALPINE_VOLUMES_DIR/$UBUNTU_TARBALL_NAME"
 
 # ---------------------------------------------------------------------------
-# Move build.img from volumes dir to out/ (canonical location).
+# Stop the provisioning VM and restart the normal Alpine VM.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "--- moving build.img to out/ ---"
-mv "$VOLUMES_IMG" "$BUILD_IMG"
-echo "  $BUILD_IMG"
+echo "--- stopping provisioning VM ---"
+stop_alpine_vm
+echo "  done"
+echo ""
+
+echo "--- restarting Alpine VM (normal, without extra-disk) ---"
+printf "  pinging... "
+if ! pelagos_alpine ping 2>&1 | grep -q pong; then
+    echo ""
+    echo "WARNING: Alpine VM did not respond after restart." >&2
+    echo "         Run 'bash scripts/vm-ping.sh' manually to restore it." >&2
+else
+    echo "ok"
+fi
+echo ""
 
 # ---------------------------------------------------------------------------
 # Write vm.conf for the build profile.
 # ---------------------------------------------------------------------------
 
-echo ""
 echo "--- writing vm.conf for profile '$PROFILE' ---"
 mkdir -p "$PROFILE_STATE_DIR"
 cat > "$PROFILE_STATE_DIR/vm.conf" << VMCONF_EOF

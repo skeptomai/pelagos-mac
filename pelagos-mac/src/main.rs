@@ -63,6 +63,13 @@ struct Cli {
     #[arg(short = 'p', long = "port", global = true)]
     ports: Vec<String>,
 
+    /// Attach an extra disk image as an additional virtio-blk device.
+    /// First extra disk → /dev/vdb, second → /dev/vdc, etc.
+    /// Used by build-build-image.sh for provisioning without virtiofs I/O overhead.
+    /// May be specified multiple times.
+    #[arg(long = "extra-disk", global = true)]
+    extra_disks: Vec<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -1099,6 +1106,7 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         virtiofs_shares,
         port_forwards,
         profile: cli.profile.clone(),
+        extra_disks: cli.extra_disks.clone(),
     }
 }
 
@@ -2182,6 +2190,7 @@ mod tests {
     };
     use clap::Parser as _;
     use std::io::Cursor;
+    use std::path::PathBuf;
 
     #[test]
     fn pong_deserializes() {
@@ -2389,6 +2398,43 @@ mod tests {
         assert!(!shares[1].read_only);
         assert_eq!(shares[0].tag, "share0");
         assert_eq!(shares[1].tag, "share1");
+    }
+
+    #[test]
+    fn cli_extra_disk_parses() {
+        let cli = Cli::try_parse_from([
+            "pelagos",
+            "--extra-disk",
+            "/out/build.img",
+            "--kernel",
+            "/out/vmlinuz",
+            "--disk",
+            "/out/root.img",
+            "ping",
+        ])
+        .unwrap();
+        assert_eq!(cli.extra_disks, vec![PathBuf::from("/out/build.img")]);
+    }
+
+    #[test]
+    fn cli_extra_disk_multiple() {
+        let cli = Cli::try_parse_from([
+            "pelagos",
+            "--extra-disk",
+            "/out/a.img",
+            "--extra-disk",
+            "/out/b.img",
+            "--kernel",
+            "/out/vmlinuz",
+            "--disk",
+            "/out/root.img",
+            "ping",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.extra_disks,
+            vec![PathBuf::from("/out/a.img"), PathBuf::from("/out/b.img")]
+        );
     }
 
     // ---------------------------------------------------------------------------
