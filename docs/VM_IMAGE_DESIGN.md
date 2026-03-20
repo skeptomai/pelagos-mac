@@ -125,8 +125,8 @@ kernel boots
   ├── load virtio_net dependencies (failover, net_failover)
   ├── ip link up eth0
   ├── udhcpc -t 5 || static 192.168.105.2/24 via 192.168.105.1
-  │     (CONFIG_PACKET=n in linux-lts-virt: udhcpc may fail;
-  │      static fallback is the socket_vmnet subnet)
+  │     (CONFIG_PACKET=n in linux-lts: udhcpc fails; static IP is used
+  │      — matches the smoltcp NAT relay subnet)
   ├── ping 8.8.8.8                  warms up AVF NAT before first TCP connect
   └── busybox timeout 10 ntpd -n -q -p pool.ntp.org
         VM clock starts at Unix epoch; TLS cert validation fails until synced
@@ -183,10 +183,9 @@ where the running kernel and staged modules came from different source trees.
   image pulls fail with TLS certificate errors. The 10-second timeout prevents
   a hang but does not fix DNS. Recovery: wait for DNS, then `pelagos vm stop`
   and restart.
-- **socket_vmnet degradation**: vmnet.framework NAT state can degrade inside
-  the socket_vmnet process (observed at ~round 18/40 in stress tests under
-  macOS 26 beta). Recovery: `sudo brew services restart socket_vmnet` then
-  `pelagos vm stop`. This is an Apple/Homebrew issue.
+- **smoltcp relay**: the NAT relay runs in-process in the daemon. It reinitializes
+  on every daemon start. If networking is broken, kill stale daemons and restart
+  (`vm-restart.sh`). No external service restart is needed.
 - **Boot time**: `ensure_running()` polls the vsock socket and retries.
   "Pong at try 6" is normal — it reflects kernel boot + module loading +
   network + NTP. Typical range is try 4–8. The polling loop is intentional;
@@ -250,6 +249,6 @@ stripped-down context rather than a full Alpine install.
 
 - `docs/DESIGN.md` — full architecture rationale and AVF binding approach
 - `docs/VM_LIFECYCLE.md` — VM start/stop/status lifecycle and daemon model
-- `docs/NETWORK_OPTIONS.md` — network attachment options and socket_vmnet setup
+- `docs/NETWORK_OPTIONS.md` — network attachment options analysis and smoltcp relay rationale
 - `scripts/build-vm-image.sh` — the authoritative image build script
 - `pelagos-guest/` — the guest daemon source

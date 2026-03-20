@@ -350,33 +350,27 @@ the macOS host. (pelagos-mac handles port forwarding via `pelagos run -p`.)
 | Issue | Status | Fix version |
 |---|---|---|
 | pelagos#120 — `/etc/hosts` absent | **CLOSED** | pelagos v0.57.0 |
-| pelagos-mac exec stdin BufReader | **CLOSED** | branch fix/devcontainer-suite-isolation |
-| pelagos#121 — exec-into missing PID namespace join | **OPEN — CURRENT BLOCKER** | TBD |
+| pelagos-mac exec stdin BufReader | **CLOSED** | PR #103 |
+| pelagos#121 — exec-into missing PID namespace join | **CLOSED** | pelagos-mac PR #107 / v0.1.0 |
+| pelagos#124 — run relays stdout before PID written to state | **CLOSED** | pelagos v0.59.0 |
 
-### Current Blocker: exec-into PID namespace (pelagos#121)
+### How the PID namespace blocker was resolved (PR #107)
 
-VS Code's `resolveAuthority` runs `aT()` which proc-scans the container and ends with
-`readlink /proc/self/ns/mnt 2>/dev/null`. This fails in pelagos containers because
-exec-into processes are **not in the container's PID namespace**:
+The root cause was that exec-into processes ran inside a mount namespace that shared
+Alpine's `/proc`. Since pelagos does NOT create a separate PID namespace for containers,
+`setns(CLONE_NEWPID)` was a no-op. The `/proc/self` symlink pointed to a PID that was
+not mounted in the process's view of `/proc`, leaving a dangling symlink.
 
-```bash
-# Inside a pelagos container via exec-into:
-ls -la /proc/self   # → 0-byte dangling symlink (points to non-existent /proc/<pid>)
-ls /proc/[0-9]*     # → only /proc/1 (container init), exec'd process invisible
-```
+**Fix:** In `pelagos-guest handle_exec_into`, after forking:
+1. The intermediate process calls `unshare(CLONE_NEWNS)` to get a private mount namespace
+2. The grandchild (`fork()` again) remounts `/proc` fresh (`mount -t proc proc /proc`)
+3. `/proc/self` now resolves correctly with VM-level PIDs
 
-**Why it matters:** `aT()` uses the shell server's `exec()` method. When the command
-exits with code 1, the shell server rejects the promise. This propagates through
-`Ioe()` → `Rl()` → `resolveAuthority()`, which fails with
-`{"code":"NotAvailable","detail":true}` at approximately T+6.8s (before the 8s timeout).
+This is correct because pelagos containers share the VM's root PID namespace — the
+fresh `/proc` mount reflects the real process tree and `/proc/self` is valid.
 
-**All other layers work correctly** — the muxrpc protocol, server install, port
-forwarding mechanism via `docker exec` node tunnel — none of this can be reached
-because `resolveAuthority` fails first.
-
-**Fix required in pelagos:** `exec_into` must call `setns(pid_ns_fd, CLONE_NEWPID)`
-before the fork/exec, joining the container's PID namespace so exec'd processes appear
-in `/proc` and `/proc/self` resolves correctly.
+**Result:** VS Code "Reopen in Container" works end-to-end. 27/27 devcontainer e2e
+tests pass. Verified manually with VS Code Insiders (v0.2.0, March 2026).
 
 ---
 

@@ -72,8 +72,8 @@ Stored in `~/.local/share/pelagos/` (respects `$XDG_DATA_HOME`):
 
 ## e2e test interaction
 
-`scripts/test-e2e.sh` stops and restarts the daemon several times during
-the run (tests 6 and 13 call `vm stop` to reset mount configuration).
+`scripts/test-devcontainer-e2e.sh` runs 27 tests across suites A–F.
+Some suites stop and restart the daemon to reset mount configuration.
 After the test suite completes the daemon is stopped. Run `pelagos ping`
 or any other command to bring it back up.
 

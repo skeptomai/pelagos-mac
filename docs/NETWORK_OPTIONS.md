@@ -1,7 +1,8 @@
 # macOS VM Networking Options — Design Analysis
 
-*Researched 2026-03-11. Covers pelagos-mac context: pure-Rust AVF stack,
-`aarch64-apple-darwin`, developer tool targeting macOS 13.5+.*
+*Researched 2026-03-11. Updated 2026-03-20 to reflect smoltcp NAT relay (PR #117,
+v0.2.0). Covers pelagos-mac context: pure-Rust AVF stack, `aarch64-apple-darwin`,
+developer tool targeting macOS 13.5+.*
 
 ---
 
@@ -10,19 +11,18 @@
 pelagos-mac boots Linux VMs via Apple's `Virtualization.framework` (AVF). Every
 networking option available to an AVF-based VM ultimately flows through one of the
 mechanisms below. This document evaluates each on six axes plus additional
-project-specific factors so that the current choice (`VZNATNetworkDeviceAttachment`)
-can be revisited with full context.
+project-specific factors.
 
-The immediate trigger is issue #26: `VZNATNetworkDeviceAttachment` degrades after
-~5 VM lifecycles because its underlying implementation (`InternetSharing`/PF) loses
-its anchor connection. The persistent VM (Phase 2) sidesteps cycling, but does not
-remove the structural fragility.
+**Current implementation (v0.2.0):** `VZFileHandleNetworkDeviceAttachment` paired
+with a pure-Rust smoltcp userspace NAT relay (`pelagos-vz/src/nat_relay.rs`). See
+option 5 + option 6 in the tables, and the "Implemented Solution" section at the
+bottom.
 
 ---
 
 ## The Options
 
-### 1. `VZNATNetworkDeviceAttachment` ← current
+### 1. `VZNATNetworkDeviceAttachment` ← replaced in v0.2.0
 
 **What it is:** AVF's "no-entitlement NAT" attachment. One method call; AVF creates
 a virtual NIC and the host provides NAT, DHCP, and DNS via the
@@ -102,7 +102,7 @@ virtualization product.
 
 ---
 
-### 3. `socket_vmnet` (privileged helper wrapping `vmnet.framework`)
+### 3. `socket_vmnet` (privileged helper wrapping `vmnet.framework`) ← evaluated, replaced
 
 **What it is:** An Apache 2.0 privileged helper daemon, maintained by the Lima team
 (`github.com/lima-vm/socket_vmnet`), that runs as root via launchd and exposes
@@ -166,7 +166,7 @@ DHCP-assigned or static IP.
 
 ---
 
-### 5. `VZFileHandleNetworkDeviceAttachment` (raw Ethernet frames)
+### 5. `VZFileHandleNetworkDeviceAttachment` (raw Ethernet frames) ← used in current implementation
 
 **What it is:** AVF attachment that exposes the VM's virtual NIC as a pair of file
 handles for raw Ethernet frame I/O. You provide a connected datagram socket (`SOCK_DGRAM`)
@@ -191,7 +191,7 @@ Socket buffer recommendation: `SO_RCVBUF` ≥ 4× `SO_SNDBUF`.
 | **Entitlements** | **None.** The attachment type itself requires no entitlement. ✓ |
 | **Open source** | N/A (AVF mechanism, not a standalone solution). |
 | **Implementation complexity** | **High.** You must implement or integrate a full networking backend. |
-| **Role in pelagos** | This is the correct integration point for connecting AVF to `socket_vmnet`. |
+| **Role in pelagos** | This is the integration point used in v0.2.0 — paired with the smoltcp NAT relay. |
 
 ---
 
@@ -219,12 +219,13 @@ having "a lot of overhead so the performance is poor." Benchmarks consistently s
 per round-trip from the user-space processing loop. For container image pulls
 (bulk HTTPS transfers), this is measurable.
 
-**Note on Rust:** There is no production-quality pure-Rust SLIRP implementation.
-`libslirp` is C (LGPL). Binding it via FFI is feasible but adds a C dependency and
-LGPL license obligation. Google's `gVisor` includes a Go user-space network stack
-(netstack) but has no Rust port. The `smoltcp` crate is a Rust no-std TCP/IP stack
-but is not SLIRP — it does not implement the host-side socket proxying that makes
-SLIRP work as NAT.
+**Note on Rust (updated v0.2.0):** pelagos-mac implemented the smoltcp-based userspace
+NAT relay (PR #117). `smoltcp` is a Rust no-std TCP/IP stack; we added the host-side
+socket proxying that makes it work as NAT. UDP is handled entirely outside smoltcp
+(raw frame interception + reply synthesis); TCP uses smoltcp with a default IPv4 route.
+This is architecturally similar to SLIRP but pure Rust, no LGPL, and no C dependency.
+Performance is sufficient for OCI image pulls and devcontainer builds — 27/27 e2e tests
+pass.
 
 | Axis | Assessment |
 |---|---|
@@ -347,53 +348,52 @@ AVF's `com.apple.security.virtualization` is required.
 
 ## Recommendation for pelagos-mac
 
-### Near-term: Persistent VM (already shipped) sidesteps the problem
+### Current implementation (v0.2.0): smoltcp userspace NAT relay
 
-The Phase 2 persistent daemon (PR #27) reduces VM lifecycle count to 1 per session.
-The NAT degradation in option 1 triggers on lifecycle *count*, not runtime duration.
-With a persistent VM, the PF anchor degrades much more slowly (potentially never in
-a normal session). This is the correct short-term mitigation and is already in
-production.
+The implemented solution is `VZFileHandleNetworkDeviceAttachment` (option 5) paired
+with a pure-Rust smoltcp NAT relay (PR #117). This replaced both `VZNATNetworkDeviceAttachment`
+(option 1) and `socket_vmnet` (option 3), which were evaluated and discarded.
 
-**Open question:** Does NAT state still degrade after N *hours* of persistent VM
-runtime even with no VM restarts? If not, option 1 is acceptable long-term with the
-persistent VM. If yes, option 3 becomes necessary.
+**Why smoltcp won:**
 
-### Medium-term: Migrate to `socket_vmnet` (option 3)
+1. **Zero external dependencies.** No Homebrew packages, no launchd daemons, no
+   privileged helpers, no installer steps. Works out of the box.
+2. **No kernel NAT state to degrade.** smoltcp is pure userspace — there is no PF
+   anchor, no vmnet handle, and no daemon that can lose its connection.
+3. **Pure Rust.** Consistent with the no-Go, no-subsystem-dependency architecture.
+4. **No entitlements.** `VZFileHandleNetworkDeviceAttachment` requires no special
+   entitlement on the caller binary.
+5. **Proven at scale.** 27/27 devcontainer e2e tests pass, including Dockerfile
+   builds with `apt-get install` (large multi-file downloads over TCP).
 
-`socket_vmnet` is the right long-term solution for pelagos-mac because:
+**Architecture:**
+```
+VM virtio-net NIC
+  → VZFileHandleNetworkDeviceAttachment (SOCK_DGRAM socketpair)
+    → pelagos-vz nat_relay.rs (smoltcp TCP stack + raw UDP interception)
+      → host TCP/UDP sockets → internet
+```
 
-1. **No entitlement required** on the pelagos binary — compatible with ad-hoc signing
-   for development and standard Developer ID for distribution.
-2. **Eliminates the PF/InternetSharing degradation** entirely — vmnet is a stable
-   kernel interface.
-3. **Apache 2.0** — clean license, no LGPL obligation.
-4. **Actively maintained** by the Lima/CNCF ecosystem.
-5. **Already proven** in Lima and QEMU on macOS.
-6. **The only cost** is a `.pkg` installer step to install the launchd daemon.
-   This is a one-time setup, not per-run overhead.
+**Known tradeoffs vs kernel NAT:**
+- Throughput for bulk transfers (OCI image pulls) is sufficient but not as fast as
+  vmnet kernel path. This has not been a practical problem.
+- Each TCP connection requires a host socket and a relay thread. Connection scaling
+  is bounded by host FD limits, not smoltcp itself.
 
-The implementation path:
-- Add a `socket_vmnet` installation step to the pelagos installer (`.pkg` or Homebrew)
-- In `pelagos-vz`, replace `VZNATNetworkDeviceAttachment` with
-  `VZFileHandleNetworkDeviceAttachment` bridged to `socket_vmnet` via the client fd
-- The VM init script's static IP setup becomes dynamic DHCP via socket_vmnet's
-  built-in DHCP server
+### Future watch items
 
-### Long-term watch: `vmnet.framework` direct (option 2) + Apple Containerization (option 8)
+**vmnet.framework direct (option 2):** If pelagos reaches commercial distribution
+and Apple entitlement approval is feasible, option 2 offers higher bulk throughput.
+File with Apple Developer Relations when there is a clear distribution story.
 
-If pelagos scales to a commercial product requiring Apple's entitlement, option 2
-offers the cleanest path (no helper daemon, highest performance). File a request with
-Apple Developer Relations once there is a clear commercial distribution story.
+**Apple Containerization (option 8):** Track for 2027 when macOS 26 has meaningful
+market share and the framework has a security track record.
 
-Option 8 (`Containerization`) is worth tracking for 2027 when macOS 26 has
-meaningful market share and the framework has accumulated a security track record.
-Its VM-per-container model aligns well with pelagos's isolation goals.
+### Ruled out
 
-### What to rule out
-
+- **Option 1 (VZNATNetworkDeviceAttachment):** PF anchor degrades; unrecoverable
+  without reboot on macOS 26. Replaced.
+- **Option 3 (socket_vmnet):** Requires a privileged launchd daemon as a Homebrew
+  install step. Replaced by the zero-dependency smoltcp relay.
 - **Option 4 (Bridged):** Wrong security model for developer container tooling.
-- **Option 6 (SLIRP):** Performance penalty is unacceptable for OCI image pulls.
-  Acceptable only as a zero-setup fallback for CI environments or unusual
-  configurations.
 - **Option 7 (Kexts):** Dead.

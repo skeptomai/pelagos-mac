@@ -451,32 +451,31 @@ the Linux VM use case.
 macOS 13.5+ covers everything pelagos needs. macOS 11/12 would require dropping virtiofs
 (fall back to SFTP or NFS) and Rosetta — a reasonable trade-off to defer.
 
-### The pilot project
+### The architecture — validated and shipped (v0.2.0)
 
-The pilot validates the architecture concretely before committing to a full
-implementation. It is not a throwaway — the pilot *is* the production component.
+The pilot phase is complete. The architecture has been validated and is production-ready
+as of v0.2.0 (March 2026).
 
 **`pelagos-vz`** — a thin ergonomic Rust crate over `objc2-virtualization`:
-- Boot a Linux VM from a kernel + initrd + disk image
-- Configure vsock (exposed as Unix socket on host), virtiofs, NAT networking, Rosetta
-- Manage VM lifecycle: start, stop, clean shutdown
-- ~500–800 lines; use `Code-Hex/vz` Go bindings as design reference for the API shape
+- Boots a Linux VM from a kernel + initrd + disk image
+- Configures vsock, virtiofs, smoltcp NAT relay, ext4 root disk
+- Manages VM lifecycle: start, stop, clean shutdown
+- Includes the full smoltcp userspace NAT relay (TCP + UDP, no external dependencies)
 
-**`pelagos-guest`** — a minimal Rust daemon that runs inside the VM as a startup service:
-- Listens on `AF_VSOCK` port N
-- Receives JSON command envelopes: `{"cmd": "run", "image": "alpine", "args": [...]}`
-- Forks `pelagos` with the given arguments
-- Streams stdout/stderr back over vsock, returns exit code
-- ~200 lines
+**`pelagos-guest`** — a Rust daemon that runs inside the VM:
+- Listens on `AF_VSOCK` port 1024
+- Handles container run, exec-into, build, ps, inspect, start, stop, rm, logs, events,
+  volume and network CRUD, port forwarding, copy, and more
+- Streams stdout/stderr back over vsock, propagates exit codes
+- Namespace-joining exec-into via direct `setns(2)` + unshare + /proc remount
 
-**What the pilot proves:**
-1. `objc2-virtualization` is usable for booting real Linux VMs
-2. vsock IPC works end-to-end from a Rust host to a Rust guest
-3. virtiofs file sharing (host directory → container bind mount) is functional
-4. The entire stack compiles and runs without any Go binary
-
-**What it does not need:** port forwarding, Rosetta, installer packaging, multi-VM
-management. Those come after the architecture is validated.
+**What has been proven:**
+1. `objc2-virtualization` boots real Linux VMs — stable and usable
+2. vsock IPC works end-to-end; stdin relay, interactive exec, concurrent sessions all work
+3. virtiofs file sharing is functional and persistent across container restarts
+4. smoltcp NAT relay handles DNS (UDP) and TCP at scale — 27/27 devcontainer e2e tests pass
+5. VS Code "Reopen in Container" works end-to-end with the full devcontainer lifecycle
+6. Zero Go in the entire stack
 
 ### Caveats
 
@@ -487,21 +486,25 @@ management. Those come after the architecture is validated.
 - macOS 13.5+ minimum for full feature set. A macOS 12 fallback (drop virtiofs +
   Rosetta) is possible but not a priority.
 
-### Known operational limitation: PF/NAT state degradation (issue #26) — RESOLVED
+### VM networking: smoltcp userspace NAT relay (PR #117) — RESOLVED
 
-`VZNATNetworkDeviceAttachment` relies on macOS `InternetSharing` to install NAT
-masquerade rules via the kernel's packet filter (PF). Stress testing confirmed that
-after approximately 18–40 VM lifecycles in a single session, InternetSharing loses its
-connection to the PF device. Symptoms: all outbound TCP from inside the VM fails
-silently; `pelagos image pull` reports "error sending request for url". ICMP (ping)
-continues working because it routes through a different PF rule set.
+`VZNATNetworkDeviceAttachment` and `socket_vmnet` have both been replaced. The VM
+network device is now `VZFileHandleNetworkDeviceAttachment` backed by a pure-Rust
+smoltcp userspace NAT relay implemented in `pelagos-vz/src/nat_relay.rs`.
 
-**Resolution (PR #34):** Migrated to `socket_vmnet` (a Homebrew package that wraps
-Apple's `vmnet.framework` directly via a privileged helper). `socket_vmnet` does not
-use InternetSharing or PF anchors; the NAT stability issue does not manifest.
-`pfctl` has no effect on `vmnet.framework` NAT — do not attempt `pfctl -f` to fix
-networking problems. If networking degrades, restart `socket_vmnet` via
-`sudo brew services restart socket_vmnet`.
+**How it works:** A `SOCK_DGRAM` socketpair bridges AVF's raw Ethernet frame I/O to
+the relay. The relay intercepts all frames: UDP is handled raw (synthesized reply
+frames); TCP connections are proxied via smoltcp's TCP stack with real host sockets.
+No external dependencies — no Homebrew packages, no launchd daemons, no privileged
+helpers, no kernel NAT involvement.
+
+**Why this is the right long-term choice:**
+- Zero install requirements: works out of the box with just the pelagos binary
+- No PF anchor degradation (smoltcp has no kernel state to degrade)
+- No `vmnet.framework` dependency or private entitlement required
+- Pure Rust: consistent with the no-Go, no-subsystem-dependency architecture
+- `pfctl` has no effect on this relay — do not attempt `pfctl -f` to fix networking
+- If networking is broken, kill stale daemons (`pkill -KILL -f "pelagos.*vm-daemon-internal"`) and restart
 
 ---
 
@@ -534,7 +537,7 @@ bus driver the device drivers have nothing to bind to.
 ### VM networking: static IP, not DHCP
 
 The VM uses a fixed static IP: `192.168.105.2/24`, gateway `192.168.105.1` (the
-`socket_vmnet` subnet). DHCP is not used.
+smoltcp NAT relay subnet). DHCP is not used.
 
 **Why static:**
 
@@ -542,11 +545,8 @@ The VM uses a fixed static IP: `192.168.105.2/24`, gateway `192.168.105.1` (the
    `AF_PACKET` sockets. With the flag absent, opening the socket fails and DHCP cannot
    work in either Alpine kernel without a custom kernel build.
 
-2. `socket_vmnet` DHCP assigns addresses sequentially from a pool. Without a pinned MAC
-   address, each VM boot gets a different lease. The host must then discover the assigned
-   IP — Lima does this by polling `/private/var/db/dhcpd_leases` and by deriving a
-   deterministic MAC from the instance ID. That is complexity we do not need for a
-   single-VM architecture.
+2. The smoltcp relay assigns `192.168.105.2` statically — no lease negotiation is
+   required. This simplifies the init script and removes any IP-discovery step.
 
 3. A fixed IP is simpler to reason about, eliminates the discovery step, and is always
    predictable.
@@ -555,9 +555,9 @@ The VM uses a fixed static IP: `192.168.105.2/24`, gateway `192.168.105.1` (the
 - `scripts/build-vm-image.sh` — the init script calls `ip addr add 192.168.105.2/24 dev eth0`
 - `pelagos-mac/src/main.rs` — the SSH target for `pelagos vm ssh`
 
-**Re-evaluation criteria:** If multi-VM support is ever added, or if a future Alpine
-kernel build re-enables `CONFIG_PACKET`, revisit with MAC pinning + DHCP lease polling
-(the Lima pattern). For single-VM use, static IP is correct.
+**Re-evaluation criteria:** If multi-VM support is ever added, revisit with per-VM
+smoltcp relay instances and dynamic IP assignment. For single-VM use, static IP is
+correct.
 
 ### VM stability notes
 
@@ -570,8 +570,9 @@ kernel build re-enables `CONFIG_PACKET`, revisit with MAC pinning + DHCP lease p
 - NTP sync is required before OCI image pulls. The VM clock starts at epoch; TLS
   certificate validation fails until `busybox ntpd -n -q -p pool.ntp.org` completes
   after the network comes up.
-- AVF NAT warmup: a `ping 8.8.8.8` is issued before `exec`-ing `pelagos-guest`. Without
-  it, the first outbound TCP connect races against NAT initialization and fails.
+- smoltcp relay warmup: a `ping 8.8.8.8` is issued before `exec`-ing `pelagos-guest`.
+  Without it, the first outbound TCP connect races against relay initialization and
+  fails.
 
 ---
 
@@ -662,6 +663,6 @@ Insufficient for enterprise.
 **Option E** is a 2027 watch item. Track the macOS 26 release and accumulation of
 security track record for the `Containerization` framework.
 
-**Immediate next step:** build the `pelagos-vz` pilot as described above. If it boots a
-Linux VM and round-trips a vsock command in under 500 lines of Rust, the architecture
-is validated and Options A–B become fallbacks rather than the plan.
+**Current status:** the architecture is validated and shipped. Options A–B are confirmed
+fallbacks. The remaining work is feature completion (notarized distribution, multi-VM,
+Rosetta, Apple Containerization watch) rather than architecture validation.

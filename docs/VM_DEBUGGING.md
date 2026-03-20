@@ -12,7 +12,8 @@ Common failure modes, recovery procedures, and test tooling.
 | `scripts/vm-restart.sh` | Kill stale daemon, clean up socket/pid, boot fresh |
 | `scripts/vm-preload.sh` | Pull all test images into root.img once (run after any rebuild or recreation) |
 | `scripts/vm-console.sh` | Attach to the VM serial console (hvc0) — shows kernel + guest logs |
-| `scripts/test-devcontainer-e2e.sh` | Full devcontainer e2e suite (22 tests, suites A–E) |
+| `scripts/test-devcontainer-e2e.sh` | Full devcontainer e2e suite (27 tests, suites A–F) |
+| `scripts/test-network-smoke.sh` | Quick DNS + TCP smoke test — verify networking before running full suite |
 | `scripts/test-vscode-exec.sh` | Reproduces the VS Code attach exec pattern (3 concurrent execs) |
 | `scripts/test-concurrent-exec.sh` | Reproduces concurrent exec-into to check for VM crash/hang |
 
@@ -71,7 +72,25 @@ rm -f ~/.local/share/pelagos/vm.pid ~/.local/share/pelagos/vm.sock
 bash scripts/vm-ping.sh
 ```
 
-Multiple daemon processes compete for the socket_vmnet connection and corrupt NAT state.
+Multiple daemon processes result in conflicting smoltcp relay instances and corrupt network state.
+
+---
+
+### Network smoke test
+
+Before running the full e2e suite, verify basic networking works:
+
+```bash
+bash scripts/test-network-smoke.sh
+```
+
+This tests VM liveness (`ping`), DNS (`getent hosts google.com`), and TCP
+(`bash /dev/tcp/example.com/80`). Should complete in under 10 seconds.
+
+If the smoke test fails:
+1. Kill stale daemons: `pkill -KILL -f "pelagos.*vm-daemon-internal"`
+2. Remove stale state: `rm -f ~/.local/share/pelagos/vm.pid ~/.local/share/pelagos/vm.sock`
+3. Restart: `bash scripts/vm-restart.sh`
 
 ---
 
@@ -95,24 +114,22 @@ bash scripts/vm-preload.sh    # re-pull test images into the fresh image
 
 ---
 
-### socket_vmnet NAT degradation (image pull I/O errors)
+### Network failure (image pull I/O errors, TCP timeout)
 
-**Symptoms:** Image pulls fail with `I/O error (os error 5)` or `error sending request`. VM otherwise appears healthy (ping works).
+**Symptoms:** Image pulls fail with `I/O error (os error 5)` or `error sending request`. VM otherwise appears healthy (ping works). Or `test-network-smoke.sh` reports DNS/TCP failure.
 
-**Cause:** vmnet.framework NAT state degrades over time or after macOS sleep/wake. Restarting socket_vmnet reinitializes it.
+**Cause:** The smoltcp NAT relay runs in the daemon process. A stale or crashed daemon leaves no relay running; new connections time out.
 
 **Fix:**
 ```bash
 pkill -KILL -f "pelagos.*vm-daemon-internal"
 rm -f ~/.local/share/pelagos/vm.pid ~/.local/share/pelagos/vm.sock
-sudo brew services restart socket_vmnet
-# Kill any daemon that started BEFORE the socket_vmnet restart:
-pkill -KILL -f "pelagos.*vm-daemon-internal"
-rm -f ~/.local/share/pelagos/vm.pid ~/.local/share/pelagos/vm.sock
 bash scripts/vm-ping.sh
 ```
 
-**Note:** `pfctl` has no effect on vmnet.framework NAT — do not use it.
+After the daemon restarts, the smoltcp relay reinitializes automatically. No external service restart is needed.
+
+**Note:** `pfctl` has no effect on the smoltcp relay — do not use it.
 
 ---
 

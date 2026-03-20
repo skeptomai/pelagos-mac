@@ -148,7 +148,7 @@ extensions in named volumes (`vscode`, `vscode-server-<hash>`).
 - `volume rm <name>` removes it permanently
 
 **Current State:** PARTIAL — `volume create/ls/rm` delegate to pelagos. Backing store
-persistence across VM restart is UNVERIFIED (issue #93).
+persistence across VM restart is UNVERIFIED (issue #93, still open).
 
 ---
 
@@ -394,7 +394,7 @@ These are end-to-end requirements for a complete devcontainer session.
 - Container is started from the built image
 - `devcontainer up` exits 0 with `"outcome": "success"`
 
-**Current State:** UNTESTED (issue #92).
+**Current State:** MEETS — verified in suite B e2e tests (TC-T2-06, TC-T2-07, TC-T2-07b). Issue #92 closed.
 
 ---
 
@@ -415,7 +415,7 @@ These are end-to-end requirements for a complete devcontainer session.
 - Multi-stage or layered build completes inside the VM
 - `node --version` works inside the container after `devcontainer up`
 
-**Current State:** UNTESTED (issue #92).
+**Current State:** MEETS — verified in suite C e2e tests (TC-T2-10, TC-T2-10b, TC-T2-10c). Issue #92 closed.
 
 ---
 
@@ -437,7 +437,7 @@ These are end-to-end requirements for a complete devcontainer session.
 - Extensions listed in `devcontainer.json` install
 - `postCreateCommand` runs and output is visible in VS Code terminal
 
-**Current State:** UNTESTED (issue #91). Requires manual VS Code interaction.
+**Current State:** MEETS — verified manually with VS Code Insiders (v0.2.0). Issue #91 remains open as a tracking issue for ongoing regression testing.
 
 ---
 
@@ -450,8 +450,8 @@ Tests are organized into three tiers:
 | Tier | Scope | Runner | CI? |
 |---|---|---|---|
 | **T1** — Shim unit | Individual `pelagos-docker` commands in isolation | `scripts/test-devcontainer-shim.sh` | Yes |
-| **T2** — Integration | Full devcontainer CLI command sequence without VS Code | `scripts/test-devcontainer-e2e.sh` (to build) | Yes |
-| **T3** — IDE | VS Code "Reopen in Container" full IDE flow | Manual (issue #91) | No |
+| **T2** — Integration | Full devcontainer CLI command sequence without VS Code | `scripts/test-devcontainer-e2e.sh` (27 tests, suites A–F) | Requires self-hosted runner |
+| **T3** — IDE | VS Code "Reopen in Container" full IDE flow | Manual | No |
 
 T1 and T2 must be scriptable, non-interactive, and runnable with a single command.
 
@@ -537,11 +537,11 @@ See issue #91. Must be performed by a human with VS Code installed. Not automata
 
 ## Part 5 — Open Issues
 
-| # | Title | Requirement | Priority |
-|---|---|---|---|
-| #91 | VS Code Remote-Containers full IDE integration test | R-DC-05 | Medium |
-| #92 | docker build end-to-end with features + custom Dockerfile | R-SH-07, R-DC-02, R-DC-03 | High |
-| #93 | Named volume backing store persistence across VM restart | R-VM-05 | High |
-| #74 | Dynamic virtiofs host-directory sharing | R-SH-05 (path translation) | Low |
-| #95 | T1 gap tests — ✅ **Done** (TC-T1-30..TC-T1-41 incorporated into rewritten harness) | All T1 gaps | — |
-| #96 | Build `test-devcontainer-e2e.sh` (T2 integration harness) | R-DC-01 through R-DC-04 | High |
+| # | Title | Requirement | Priority | State |
+|---|---|---|---|---|
+| #91 | VS Code Remote-Containers full IDE integration test | R-DC-05 | Medium | Open — ongoing regression tracking |
+| #93 | Named volume backing store persistence across VM restart | R-VM-05 | High | Open |
+| #74 | Dynamic virtiofs host-directory sharing | R-SH-05 (path translation) | Low | Open |
+| #92 | docker build end-to-end with features + custom Dockerfile | R-SH-07, R-DC-02, R-DC-03 | — | **Closed** ✓ |
+| #95 | T1 gap tests | All T1 gaps | — | **Closed** ✓ |
+| #96 | Build `test-devcontainer-e2e.sh` (T2 integration harness) | R-DC-01 through R-DC-04 | — | **Closed** ✓ (27 tests ship in v0.2.0) |

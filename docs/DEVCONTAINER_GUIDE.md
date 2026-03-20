@@ -4,7 +4,8 @@ This guide explains how to use VS Code's Dev Containers extension with pelagos-m
 
 ## Prerequisites
 
-- pelagos-mac installed and the VM image built (`make all`)
+- pelagos-mac built and signed (`cargo build --release -p pelagos-mac && bash scripts/sign.sh`)
+- VM image built (`bash scripts/build-vm-image.sh`)
 - VS Code with the [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension
 - `pelagos-docker` on your PATH
 
@@ -122,8 +123,8 @@ run are not preserved. Use named volumes for any state you want to persist.
 
 ## Limitations
 
-- Bridge networking (`--network bridge`) requires the VM to be started with root. Use the
-  default pasta mode or loopback for rootless operation.
+- Bridge networking (`--network bridge`) is not supported. Use the default networking
+  (smoltcp NAT relay) or loopback.
 - Port forwarding is configured at VM boot time. If you need different ports, run
   `pelagos vm stop` first, then restart with the new `-p` flags.
 - Interactive TTY (`docker run -it`) works via the vsock relay. Very large terminal

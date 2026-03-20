@@ -17,15 +17,11 @@ Do not call `pelagos exec <container> <cmd>` as a subprocess from guest code.
 `src/cli/exec.rs`: `"exec: skipping PID namespace join (host PID namespace
 limitation)"`). The exec'd process runs in the host (Alpine VM) PID namespace.
 
-This is not fixable without a double-fork inside `pre_exec`: `setns(CLONE_NEWPID)`
-only updates `pid_for_children`; the exec'd process itself is not inside the
-new PID namespace until a subsequent `fork()`. Neither `pelagos exec` nor our
-direct `setns` code currently implements this double-fork. Both have the same
-PID namespace limitation for now.
-
-For VS Code devcontainer operations (file access, script execution), running in
-the host PID namespace is acceptable — these operations don't depend on the
-container's PID space.
+This is acceptable because pelagos does NOT create a separate PID namespace for
+containers (NSpid in `/proc/1/status` shows only one level — no container PID
+namespace exists to join). For exec-into in pelagos-guest, the double-fork approach
+(`unshare(CLONE_NEWNS)` + remount `/proc`) makes `/proc/self` resolve with VM-level
+PIDs, which is sufficient for VS Code's `resolveAuthority` checks.
 
 ### What is NOT a reason
 

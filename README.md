@@ -1,48 +1,118 @@
 # pelagos-mac
 
-macOS CLI for the [pelagos](https://github.com/skeptomai/pelagos) Linux container runtime.
+macOS CLI for the [pelagos](https://github.com/skeptomai/pelagos) Linux container
+runtime. Runs pelagos containers on Apple Silicon by managing a lightweight Linux VM
+via Apple's Virtualization Framework.
 
-pelagos uses Linux namespaces, cgroups, and seccomp — Linux-only kernel primitives. On
-Apple Silicon a Linux VM is mandatory. This project owns that VM layer and the macOS
-user experience, with a pure-Rust stack and no subsystem dependencies.
+## Status
+
+**v0.2.0 — functional.** VS Code devcontainer support works end-to-end. 27/27
+devcontainer e2e tests pass (suites A–F). The architecture is pure Rust with no
+Go, no Lima, and no subsystem dependencies.
 
 ## Architecture
 
 ```
-pelagos (macOS CLI)
+pelagos-mac (macOS CLI)
   │
-  ├── pelagos-vz       Boots a Linux VM via Apple Virtualization Framework
-  │     └── objc2-virtualization (Rust bindings, auto-generated from Xcode SDK)
+  ├── pelagos-vz        Boots a Linux VM via Apple Virtualization Framework
+  │     ├── objc2-virtualization (Rust bindings, auto-generated from Xcode SDK)
+  │     └── nat_relay.rs (smoltcp userspace NAT — replaces socket_vmnet)
   │
-  ├── virtiofsd        Host-side virtiofs daemon (Rust, Red Hat)
-  │
-  └── vsock            Forwards commands to the guest over a Unix socket
+  └── vsock             Forwards commands to the guest over AVF vsock
         │
-        └── pelagos-guest (inside the VM)
+        └── pelagos-guest (inside the VM, aarch64 Alpine Linux)
               └── pelagos binary
 ```
 
-No Go. No Lima. No gRPC daemon. See [docs/DESIGN.md](docs/DESIGN.md) for full rationale.
-
-## Status
-
-**Pilot phase.** The architecture is designed; implementation is in progress.
+No Go. No Lima. No gRPC daemon. No privileged helpers. No Homebrew networking
+dependencies. See [docs/DESIGN.md](docs/DESIGN.md) for full rationale.
 
 ## Requirements
 
-- macOS 13.5+ (Ventura)
-- Apple Silicon (aarch64)
-- Xcode command line tools
+- macOS 13.5+ (Ventura), Apple Silicon
+- Xcode Command Line Tools
+- Rust toolchain (`rustup`)
 
 ## Building
 
 ```bash
-# Host binaries (macOS)
+# 1. Build host binary
 cargo build --release -p pelagos-mac
 
-# Guest daemon (cross-compiled for Linux ARM64)
-cargo build --target aarch64-unknown-linux-gnu --release -p pelagos-guest
+# 2. Re-sign after every build (mandatory — cargo strips the AVF entitlement)
+bash scripts/sign.sh
+
+# 3. Build VM image (first time, or after guest changes)
+bash scripts/build-vm-image.sh
 ```
+
+Or use `make all` to do all three in one step.
+
+**Why sign.sh is mandatory:** `cargo build` replaces the binary with a
+linker-signed copy that lacks `com.apple.security.virtualization`. Without it,
+macOS silently kills the VM daemon the moment it calls into Virtualization.framework.
+The log shows nothing; `vm status` says "stopped". Always re-sign after every build.
+
+### Cross-compiling the guest
+
+```bash
+make build-guest
+```
+
+The guest is built as a static musl binary (`aarch64-unknown-linux-musl`) and baked
+into the VM image by `build-vm-image.sh`.
+
+## Using with VS Code Dev Containers
+
+Set the Docker executable in VS Code settings:
+
+```json
+{
+  "dev.containers.dockerPath": "/path/to/pelagos-docker"
+}
+```
+
+See [docs/DEVCONTAINER_GUIDE.md](docs/DEVCONTAINER_GUIDE.md) for the full guide.
+
+## Testing
+
+```bash
+# Smoke test — verify VM liveness + DNS + TCP (< 10 s)
+bash scripts/test-network-smoke.sh
+
+# Full devcontainer e2e suite (27 tests)
+bash scripts/test-devcontainer-e2e.sh
+
+# Individual suites
+bash scripts/test-devcontainer-e2e.sh --suite A   # pre-built images
+bash scripts/test-devcontainer-e2e.sh --suite B   # custom Dockerfile
+bash scripts/test-devcontainer-e2e.sh --suite C   # devcontainer features
+bash scripts/test-devcontainer-e2e.sh --suite D   # postCreateCommand
+```
+
+## Codebase
+
+| Crate | Target | Description |
+|---|---|---|
+| `pelagos-mac` | aarch64-apple-darwin | macOS CLI binary |
+| `pelagos-vz` | aarch64-apple-darwin | AVF bindings + smoltcp NAT relay |
+| `pelagos-docker` | aarch64-apple-darwin | Docker CLI compatibility shim |
+| `pelagos-guest` | aarch64-unknown-linux-musl | Guest daemon (runs inside VM) |
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [docs/DESIGN.md](docs/DESIGN.md) | Architecture rationale, options evaluated, security analysis |
+| [docs/NETWORK_OPTIONS.md](docs/NETWORK_OPTIONS.md) | VM networking options and smoltcp relay design |
+| [docs/VM_IMAGE_DESIGN.md](docs/VM_IMAGE_DESIGN.md) | Kernel selection, initramfs, module loading |
+| [docs/VM_LIFECYCLE.md](docs/VM_LIFECYCLE.md) | VM start/stop/status and daemon model |
+| [docs/VM_DEBUGGING.md](docs/VM_DEBUGGING.md) | Common failures and recovery procedures |
+| [docs/DEVCONTAINER_GUIDE.md](docs/DEVCONTAINER_GUIDE.md) | VS Code devcontainer setup |
+| [docs/DEVCONTAINER_REQUIREMENTS.md](docs/DEVCONTAINER_REQUIREMENTS.md) | devcontainer requirements and test matrix |
+| [docs/VSCODE_ATTACH_SPEC.md](docs/VSCODE_ATTACH_SPEC.md) | VS Code attach protocol — layer-by-layer spec |
+| [docs/GUEST_CONTAINER_EXEC.md](docs/GUEST_CONTAINER_EXEC.md) | Container namespace joining implementation |
 
 ## License
 
