@@ -7,17 +7,19 @@ via Apple's Virtualization Framework.
 ## Status
 
 **v0.2.0 — functional.** VS Code devcontainer support works end-to-end. 27/27
-devcontainer e2e tests pass (suites A–F). The architecture is pure Rust with no
-Go, no Lima, and no subsystem dependencies.
+devcontainer e2e tests pass (suites A–F).
 
 ## Architecture
+
+The stack is kept deliberately minimal — library dependencies only, no subsystem
+dependencies. Every component is owned or directly wrapped:
 
 ```
 pelagos-mac (macOS CLI)
   │
   ├── pelagos-vz        Boots a Linux VM via Apple Virtualization Framework
   │     ├── objc2-virtualization (Rust bindings, auto-generated from Xcode SDK)
-  │     └── nat_relay.rs (smoltcp userspace NAT — replaces socket_vmnet)
+  │     └── nat_relay.rs (smoltcp userspace NAT relay)
   │
   └── vsock             Forwards commands to the guest over AVF vsock
         │
@@ -25,8 +27,9 @@ pelagos-mac (macOS CLI)
               └── pelagos binary
 ```
 
-No Go. No Lima. No gRPC daemon. No privileged helpers. No Homebrew networking
-dependencies. See [docs/DESIGN.md](docs/DESIGN.md) for full rationale.
+Pure Rust throughout. No Go, no Lima, no gRPC daemon, no privileged helpers, no
+Homebrew networking prerequisites. See [docs/DESIGN.md](docs/DESIGN.md) for the
+full rationale.
 
 ## Requirements
 
