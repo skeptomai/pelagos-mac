@@ -499,16 +499,25 @@ fn main() {
                     process::exit(1);
                 }
             }
-            if !state.ssh_key_file.exists() {
+            // The SSH key is baked into the VM image and lives in the default
+            // state dir regardless of the active profile.
+            let ssh_key = match state::global_ssh_key_file() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
+            };
+            if !ssh_key.exists() {
                 eprintln!(
                     "error: SSH key not found at {}. Rebuild the VM image with 'make image'.",
-                    state.ssh_key_file.display()
+                    ssh_key.display()
                 );
                 process::exit(1);
             }
             let mut cmd = std::process::Command::new("ssh");
             cmd.arg("-i")
-                .arg(&state.ssh_key_file)
+                .arg(&ssh_key)
                 .arg("-o")
                 .arg("StrictHostKeyChecking=no")
                 .arg("-o")

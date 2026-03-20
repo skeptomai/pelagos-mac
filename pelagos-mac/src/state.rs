@@ -13,9 +13,6 @@ pub struct StateDir {
     pub mounts_file: PathBuf,
     /// Active port forwards for the running daemon (JSON).
     pub ports_file: PathBuf,
-    /// Ed25519 private key for SSH access to the VM (pelagos vm ssh).
-    /// The corresponding public key is baked into the VM initramfs at build time.
-    pub ssh_key_file: PathBuf,
 }
 
 impl StateDir {
@@ -38,7 +35,6 @@ impl StateDir {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
-            ssh_key_file: base.join("vm_key"),
         })
     }
 
@@ -119,6 +115,16 @@ impl StateDir {
     }
 }
 
+/// Returns the path to the SSH private key used for `pelagos vm ssh`.
+///
+/// The key is generated once by `build-vm-image.sh` and baked into the VM
+/// initramfs as the only authorised key.  It is a global artifact — all
+/// profiles boot the same image and therefore share the same key.  It always
+/// lives in the default (root) pelagos data dir, regardless of the active profile.
+pub fn global_ssh_key_file() -> io::Result<PathBuf> {
+    Ok(pelagos_base()?.join("vm_key"))
+}
+
 /// Returns the base pelagos data dir (respects XDG_DATA_HOME).
 fn pelagos_base() -> io::Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
@@ -166,7 +172,6 @@ mod tests {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
-            ssh_key_file: base.join("vm_key"),
         }
     }
 
@@ -271,7 +276,6 @@ mod tests {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
-            ssh_key_file: base.join("vm_key"),
         };
         assert_eq!(s.pid_file, PathBuf::from("/tmp/pelagos-path-test/vm.pid"));
         assert_eq!(s.sock_file, PathBuf::from("/tmp/pelagos-path-test/vm.sock"));
@@ -286,10 +290,6 @@ mod tests {
         assert_eq!(
             s.ports_file,
             PathBuf::from("/tmp/pelagos-path-test/vm.ports")
-        );
-        assert_eq!(
-            s.ssh_key_file,
-            PathBuf::from("/tmp/pelagos-path-test/vm_key")
         );
     }
 
