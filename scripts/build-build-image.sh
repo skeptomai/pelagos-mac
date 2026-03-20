@@ -324,7 +324,8 @@ echo ""
 # ---------------------------------------------------------------------------
 
 echo "--- running provisioning script in Alpine VM ---"
-echo "    (downloads Ubuntu, installs packages, installs Rust — takes several minutes)"
+echo "    waiting for VM SSH to become available (~30s cold start)..."
+echo "    once connected, [provision] log lines will stream in real-time"
 echo ""
 
 pelagos_provision vm ssh -- sh /var/lib/pelagos/volumes/provision-build.sh
