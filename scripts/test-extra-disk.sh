@@ -20,6 +20,7 @@ KERNEL="$REPO_ROOT/out/vmlinuz"
 INITRD="$REPO_ROOT/out/initramfs-custom.gz"
 DISK="$REPO_ROOT/out/root.img"
 EXTRA_IMG="/tmp/pelagos-test-extra.img"
+PELAGOS_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/pelagos"
 
 LEVEL_MAX=3
 if [[ "${1:-}" == "--level" ]]; then
@@ -107,7 +108,6 @@ fi
 echo ""
 echo "=== Level 3: /dev/vdb visible inside VM ==="
 
-PELAGOS_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/pelagos"
 SSH_KEY="$PELAGOS_BASE/vm_key"
 
 if [[ ! -f "$SSH_KEY" ]]; then
