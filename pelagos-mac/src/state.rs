@@ -1,5 +1,6 @@
 //! Persistent VM state: PID file, Unix socket path, and mounts config
-//! stored in ~/.local/share/pelagos/.
+//! stored in ~/.local/share/pelagos/ (default profile) or
+//! ~/.local/share/pelagos/profiles/<name>/ (named profiles).
 
 use std::io;
 use std::path::PathBuf;
@@ -12,14 +13,21 @@ pub struct StateDir {
     pub mounts_file: PathBuf,
     /// Active port forwards for the running daemon (JSON).
     pub ports_file: PathBuf,
-    /// Ed25519 private key for SSH access to the VM (pelagos vm ssh).
-    /// The corresponding public key is baked into the VM initramfs at build time.
-    pub ssh_key_file: PathBuf,
 }
 
 impl StateDir {
+    /// Open the default profile state directory (~/.local/share/pelagos/).
+    #[allow(dead_code)]
     pub fn open() -> io::Result<Self> {
-        let base = base_dir()?;
+        Self::open_profile("default")
+    }
+
+    /// Open a named profile state directory.
+    ///
+    /// `"default"` maps to `~/.local/share/pelagos/` (backwards-compatible).
+    /// Any other name maps to `~/.local/share/pelagos/profiles/<name>/`.
+    pub fn open_profile(name: &str) -> io::Result<Self> {
+        let base = profile_dir(name)?;
         std::fs::create_dir_all(&base)?;
         Ok(Self {
             pid_file: base.join("vm.pid"),
@@ -27,7 +35,6 @@ impl StateDir {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
-            ssh_key_file: base.join("vm_key"),
         })
     }
 
@@ -108,14 +115,37 @@ impl StateDir {
     }
 }
 
-fn base_dir() -> io::Result<PathBuf> {
-    // Respect XDG_DATA_HOME if set, otherwise ~/.local/share/pelagos
+/// Returns the path to the SSH private key used for `pelagos vm ssh`.
+///
+/// The key is generated once by `build-vm-image.sh` and baked into the VM
+/// initramfs as the only authorised key.  It is a global artifact — all
+/// profiles boot the same image and therefore share the same key.  It always
+/// lives in the default (root) pelagos data dir, regardless of the active profile.
+pub fn global_ssh_key_file() -> io::Result<PathBuf> {
+    Ok(pelagos_base()?.join("vm_key"))
+}
+
+/// Returns the base pelagos data dir (respects XDG_DATA_HOME).
+fn pelagos_base() -> io::Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         return Ok(PathBuf::from(xdg).join("pelagos"));
     }
     let home = std::env::var("HOME")
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "$HOME not set"))?;
     Ok(PathBuf::from(home).join(".local/share/pelagos"))
+}
+
+/// Returns the state directory for a given profile name.
+///
+/// "default" → `~/.local/share/pelagos/`
+/// other     → `~/.local/share/pelagos/profiles/<name>/`
+pub fn profile_dir(name: &str) -> io::Result<PathBuf> {
+    let base = pelagos_base()?;
+    if name == "default" {
+        Ok(base)
+    } else {
+        Ok(base.join("profiles").join(name))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +172,6 @@ mod tests {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
-            ssh_key_file: base.join("vm_key"),
         }
     }
 
@@ -247,7 +276,6 @@ mod tests {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
-            ssh_key_file: base.join("vm_key"),
         };
         assert_eq!(s.pid_file, PathBuf::from("/tmp/pelagos-path-test/vm.pid"));
         assert_eq!(s.sock_file, PathBuf::from("/tmp/pelagos-path-test/vm.sock"));
@@ -263,9 +291,39 @@ mod tests {
             s.ports_file,
             PathBuf::from("/tmp/pelagos-path-test/vm.ports")
         );
+    }
+
+    /// default profile maps to the root pelagos data dir (backward compat).
+    #[test]
+    fn profile_dir_default_stays_at_root() {
+        std::env::set_var("XDG_DATA_HOME", "/tmp/pelagos-xdg-test");
+        let d = super::profile_dir("default").unwrap();
+        assert_eq!(d, PathBuf::from("/tmp/pelagos-xdg-test/pelagos"));
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    /// named profile maps to profiles/<name>/ subdir.
+    #[test]
+    fn profile_dir_named_uses_subdirectory() {
+        std::env::set_var("XDG_DATA_HOME", "/tmp/pelagos-xdg-test");
+        let d = super::profile_dir("build").unwrap();
         assert_eq!(
-            s.ssh_key_file,
-            PathBuf::from("/tmp/pelagos-path-test/vm_key")
+            d,
+            PathBuf::from("/tmp/pelagos-xdg-test/pelagos/profiles/build")
         );
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    /// default and named profiles use distinct state directories.
+    #[test]
+    fn profiles_are_isolated() {
+        std::env::set_var("XDG_DATA_HOME", "/tmp/pelagos-isolation-test");
+        let default_dir = super::profile_dir("default").unwrap();
+        let named_dir = super::profile_dir("myprofile").unwrap();
+        // Paths must differ.
+        assert_ne!(default_dir, named_dir);
+        // Named profile lives under profiles/ inside the base dir.
+        assert!(named_dir.starts_with(default_dir.join("profiles")));
+        std::env::remove_var("XDG_DATA_HOME");
     }
 }

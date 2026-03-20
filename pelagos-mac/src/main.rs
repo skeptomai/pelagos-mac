@@ -24,6 +24,11 @@ mod state;
 #[derive(Parser)]
 #[command(name = "pelagos", about = "pelagos container runtime for macOS")]
 struct Cli {
+    /// VM profile name (default: "default"). Named profiles use isolated state
+    /// directories at ~/.local/share/pelagos/profiles/<name>/.
+    #[arg(long, default_value = "default", global = true)]
+    profile: String,
+
     /// Path to the VM kernel image
     #[arg(long, env = "PELAGOS_KERNEL")]
     kernel: Option<PathBuf>,
@@ -214,6 +219,15 @@ enum Commands {
         /// Port forward HOST_PORT:VM_PORT (repeatable).
         #[arg(short = 'p', long = "port")]
         ports: Vec<String>,
+    },
+
+    /// Internal: SSH ProxyCommand helper — connects stdin/stdout to a VM port
+    /// via the smoltcp NAT relay proxy. Used by `pelagos vm ssh`. Not for
+    /// direct use.
+    #[command(hide = true)]
+    SshRelayProxy {
+        /// VM port to connect to (e.g. 22 for SSH).
+        port: u16,
     },
 }
 
@@ -413,6 +427,7 @@ fn recv_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
+    let profile = cli.profile.clone();
 
     match cli.command {
         Commands::VmDaemonInternal => {
@@ -422,10 +437,10 @@ fn main() {
 
         Commands::Vm {
             sub: VmCommands::Stop,
-        } => vm_stop(),
+        } => vm_stop(&profile),
         Commands::Vm {
             sub: VmCommands::Status,
-        } => vm_status(),
+        } => vm_status(&profile),
         Commands::Vm {
             sub: VmCommands::Shell,
         } => {
@@ -435,7 +450,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(exec_command(stream, GuestCommand::Shell { tty }, tty));
         }
 
@@ -447,7 +462,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -479,7 +494,7 @@ fn main() {
             sub: VmCommands::Ssh { ref extra },
         } => {
             let extra = extra.clone();
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -493,23 +508,43 @@ fn main() {
                     process::exit(1);
                 }
             }
-            if !state.ssh_key_file.exists() {
+            // The SSH key is baked into the VM image and lives in the default
+            // state dir regardless of the active profile.
+            let ssh_key = match state::global_ssh_key_file() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
+            };
+            if !ssh_key.exists() {
                 eprintln!(
                     "error: SSH key not found at {}. Rebuild the VM image with 'make image'.",
-                    state.ssh_key_file.display()
+                    ssh_key.display()
                 );
                 process::exit(1);
             }
+            // Route SSH through the smoltcp relay proxy — the host has no
+            // direct route to 192.168.105.2, but the relay proxy at
+            // 127.0.0.1:RELAY_PROXY_PORT can forward TCP to any VM port.
+            // We use ourselves as the ProxyCommand so no external tools are needed.
+            let exe = std::env::current_exe().unwrap_or_else(|_| {
+                eprintln!("error: cannot determine current executable path");
+                process::exit(1);
+            });
+            let proxy_cmd = format!("{} ssh-relay-proxy 22", exe.display());
             let mut cmd = std::process::Command::new("ssh");
             cmd.arg("-i")
-                .arg(&state.ssh_key_file)
+                .arg(&ssh_key)
                 .arg("-o")
                 .arg("StrictHostKeyChecking=no")
                 .arg("-o")
                 .arg("UserKnownHostsFile=/dev/null")
                 .arg("-o")
                 .arg("LogLevel=ERROR")
-                .arg("root@192.168.105.2");
+                .arg("-o")
+                .arg(format!("ProxyCommand={}", proxy_cmd))
+                .arg("root@vm"); // hostname is arbitrary; ProxyCommand handles routing
             for arg in &extra {
                 cmd.arg(arg);
             }
@@ -585,7 +620,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Run {
@@ -616,7 +651,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(exec_command(
                 stream,
                 GuestCommand::Exec {
@@ -649,7 +684,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(exec_command(
                 stream,
                 GuestCommand::ExecInto {
@@ -669,7 +704,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(ping_command(stream));
         }
 
@@ -679,7 +714,7 @@ fn main() {
             // mounts), just connect and ask.  This allows `docker ps` (called by
             // the devcontainer CLI) to return empty before the container is started
             // without triggering a "different mount configuration" error.
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open state dir: {}", e);
@@ -690,7 +725,7 @@ fn main() {
                 // No daemon = no containers.
                 process::exit(0);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(stream, GuestCommand::Ps { all }));
         }
 
@@ -701,7 +736,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Logs { name, follow },
@@ -715,7 +750,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::ContainerInspect { name },
@@ -729,7 +764,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(stream, GuestCommand::Start { name }));
         }
 
@@ -740,7 +775,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(stream, GuestCommand::Stop { name }));
         }
 
@@ -751,7 +786,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Rm { name, force },
@@ -775,7 +810,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(build_command(
                 stream,
                 &tag,
@@ -791,7 +826,7 @@ fn main() {
             let name = name.clone();
             // If no daemon is running there are no volumes.  Return immediately
             // so devcontainer pre-flight checks don't trigger a full VM boot.
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open state dir: {}", e);
@@ -816,7 +851,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Volume { sub, name },
@@ -828,7 +863,7 @@ fn main() {
             let args = args.clone();
             // Same early-return pattern as Volume: pre-flight network checks
             // should not boot the VM when no daemon is running.
-            let state = match state::StateDir::open() {
+            let state = match state::StateDir::open_profile(&profile) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open state dir: {}", e);
@@ -853,7 +888,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             process::exit(passthrough_command(
                 stream,
                 GuestCommand::Network { sub, args },
@@ -866,7 +901,7 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
-            let stream = connect_or_exit();
+            let stream = connect_or_exit(&profile);
             // One of src/dst must be `container:path`; the other is a local path.
             if let Some((container, src_path)) = parse_container_path(src) {
                 let local_dst = dst.as_str();
@@ -882,6 +917,10 @@ fn main() {
 
         Commands::PortProxy { ref ports } => {
             cmd_port_proxy(ports);
+        }
+
+        Commands::SshRelayProxy { port } => {
+            ssh_relay_proxy(port);
         }
     }
 }
@@ -912,6 +951,63 @@ fn cmd_port_proxy(ports: &[String]) {
     }
 }
 
+/// SSH ProxyCommand helper: connect stdin/stdout to a VM port via the smoltcp
+/// NAT relay proxy at 127.0.0.1:RELAY_PROXY_PORT.
+///
+/// Protocol: connect → write 2-byte big-endian port number → raw stream.
+/// SSH invokes this as a subprocess and speaks SSH protocol over its stdio.
+fn ssh_relay_proxy(port: u16) -> ! {
+    use std::fs::File;
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::os::unix::io::FromRawFd;
+
+    const RELAY_PROXY_PORT: u16 = pelagos_vz::nat_relay::RELAY_PROXY_PORT;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], RELAY_PROXY_PORT));
+    let mut relay = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
+        .unwrap_or_else(|e| {
+            eprintln!("ssh-relay-proxy: connect relay: {}", e);
+            process::exit(1);
+        });
+
+    // Send the 2-byte big-endian target port inside the VM.
+    relay.write_all(&port.to_be_bytes()).unwrap_or_else(|e| {
+        eprintln!("ssh-relay-proxy: write port: {}", e);
+        process::exit(1);
+    });
+
+    // Proxy stdin → relay and relay → stdout in two threads.
+    // When either direction closes, call process::exit immediately.
+    // SSH waits for the ProxyCommand process to exit before it considers
+    // the session done; blocking on the other direction creates a deadlock
+    // (SSH holds its write pipe open waiting for us to exit; we're blocked
+    // reading that pipe waiting for SSH to close it).
+    //
+    // IMPORTANT: stdout() uses a LineWriter that only flushes on '\n'.
+    // The SSH banner ends with \r\n (flushed), but the subsequent binary
+    // KEXINIT packet has no newline and would be buffered indefinitely.
+    // Write to raw fd 1 directly (via File::from_raw_fd) to bypass the
+    // LineWriter and ensure all bytes reach SSH immediately.
+    let relay_read = relay.try_clone().expect("clone relay");
+    std::thread::spawn(move || {
+        let mut src = std::io::stdin().lock();
+        let mut dst = relay;
+        let _ = std::io::copy(&mut src, &mut dst);
+        process::exit(0);
+    });
+    std::thread::spawn(move || {
+        let mut src = relay_read;
+        // SAFETY: fd 1 is stdout, open for the lifetime of this process.
+        let mut dst = unsafe { File::from_raw_fd(1) };
+        let _ = std::io::copy(&mut src, &mut dst);
+        process::exit(0);
+    });
+    // Park; the proxy threads call process::exit when either side closes.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(86400));
+    }
+}
+
 fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     let kernel = cli.kernel.clone().unwrap_or_else(|| {
         log::error!("--kernel / PELAGOS_KERNEL is required");
@@ -922,9 +1018,9 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         process::exit(1);
     });
 
-    // Always-on volumes share: ~/.local/share/pelagos/volumes → /var/lib/pelagos/volumes in VM.
+    // Always-on volumes share: <profile-dir>/volumes → /var/lib/pelagos/volumes in VM.
     // This makes named pelagos volumes persistent across VM restarts (virtiofs-backed on host).
-    let volumes_host = pelagos_volumes_host_path();
+    let volumes_host = pelagos_volumes_host_path(&cli.profile);
     if let Err(e) = std::fs::create_dir_all(&volumes_host) {
         log::warn!(
             "could not create volumes directory {}: {}",
@@ -993,17 +1089,19 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
         cpus: cli.cpus,
         virtiofs_shares,
         port_forwards,
+        profile: cli.profile.clone(),
     }
 }
 
-/// Returns `~/.local/share/pelagos/volumes`, the host-side backing directory for
-/// the always-on `pelagos-volumes` virtiofs share.
-fn pelagos_volumes_host_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("pelagos")
+/// Returns the host-side backing directory for the always-on `pelagos-volumes`
+/// virtiofs share.  For the default profile this is `~/.local/share/pelagos/volumes`;
+/// for named profiles it is `~/.local/share/pelagos/profiles/<name>/volumes`.
+fn pelagos_volumes_host_path(profile: &str) -> PathBuf {
+    state::profile_dir(profile)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".local/share/pelagos")
+        })
         .join("volumes")
 }
 
@@ -1112,8 +1210,8 @@ fn parse_volumes(volumes: &[String]) -> Vec<daemon::VirtiofsShare> {
         .collect()
 }
 
-fn connect_or_exit() -> UnixStream {
-    daemon::connect().unwrap_or_else(|e| {
+fn connect_or_exit(profile: &str) -> UnixStream {
+    daemon::connect(profile).unwrap_or_else(|e| {
         log::error!("connect to VM daemon: {}", e);
         process::exit(1);
     })
@@ -1123,8 +1221,8 @@ fn connect_or_exit() -> UnixStream {
 // VM management commands
 // ---------------------------------------------------------------------------
 
-fn vm_stop() {
-    let state = state::StateDir::open().unwrap_or_else(|e| {
+fn vm_stop(profile: &str) {
+    let state = state::StateDir::open_profile(profile).unwrap_or_else(|e| {
         log::error!("state dir: {}", e);
         process::exit(1);
     });
@@ -1151,8 +1249,8 @@ fn vm_stop() {
     }
 }
 
-fn vm_status() {
-    let state = state::StateDir::open().unwrap_or_else(|e| {
+fn vm_status(profile: &str) {
+    let state = state::StateDir::open_profile(profile).unwrap_or_else(|e| {
         log::error!("state dir: {}", e);
         process::exit(1);
     });
