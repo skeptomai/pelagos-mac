@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# vm-ssh.sh — Open an SSH session to the VM.
-#
-# Connects as root to the VM's dropbear sshd using the key pair generated
-# by build-vm-image.sh at ~/.local/share/pelagos/vm_key.
+# vm-ssh.sh — SSH into the running VM.
 #
 # Usage:
-#   ./scripts/vm-ssh.sh              — interactive root shell
-#   ./scripts/vm-ssh.sh -- uname -s  — run a single command
+#   bash scripts/vm-ssh.sh [--profile <name>] [-- <ssh-extra-args>...]
 #
-# Prerequisites:
-#   - make image   (builds out/vmlinuz, out/initramfs-custom.gz, out/root.img)
-#   - make sign    (builds and signs target/aarch64-apple-darwin/release/pelagos)
-
+# Options:
+#   --profile <name>  Target a named VM profile (default: "default").
+#   --                Everything after -- is passed directly to ssh.
+#
+# Example:
+#   bash scripts/vm-ssh.sh -- uname -a
+#   bash scripts/vm-ssh.sh -- -T "cat /etc/os-release"
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,19 +20,28 @@ KERNEL="$REPO_ROOT/out/vmlinuz"
 INITRD="$REPO_ROOT/out/initramfs-custom.gz"
 DISK="$REPO_ROOT/out/root.img"
 BINARY="$REPO_ROOT/target/aarch64-apple-darwin/release/pelagos"
-CMDLINE="console=hvc0"
+
+PROFILE_ARG=()
+EXTRA_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --profile) PROFILE_ARG=(--profile "$2"); shift 2 ;;
+        --)        shift; EXTRA_ARGS=("$@"); break ;;
+        *)         echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
 
 for f in "$KERNEL" "$INITRD" "$DISK" "$BINARY"; do
-    if [ ! -f "$f" ]; then
+    if [[ ! -f "$f" ]]; then
         echo "Missing: $f" >&2
-        echo "Run 'make image' and 'make sign' first." >&2
+        echo "Run 'make all' first." >&2
         exit 1
     fi
 done
 
 exec "$BINARY" \
-    --kernel  "$KERNEL" \
-    --initrd  "$INITRD" \
-    --disk    "$DISK" \
-    --cmdline "$CMDLINE" \
-    vm ssh "$@"
+    "${PROFILE_ARG[@]}" \
+    --kernel "$KERNEL" \
+    --initrd "$INITRD" \
+    --disk   "$DISK" \
+    vm ssh "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
