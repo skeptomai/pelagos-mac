@@ -1,7 +1,20 @@
 # pelagos-mac — Ongoing Tasks
 
 
-*Last updated: 2026-03-19 — **v0.1.0 tagged and released** (SHA 2f31fa0)*
+*Last updated: 2026-03-20 — **pelagos runtime integrated** (SHA 5615278)*
+
+---
+
+## Recent Setup (2026-03-20)
+
+**New machine setup — pelagos runtime integration completed:**
+
+1. Cloned pelagos repo → `~/Projects/pelagos` (v0.59.0-2-g5e97aab)
+2. Installed `cargo-zigbuild` for cross-compilation
+3. Built pelagos for `aarch64-unknown-linux-musl` target (12 MB binary)
+4. Updated `scripts/build-vm-image.sh` → changed hardcoded `/Users/cb/` to `$HOME`
+
+**Ready for VM image build:** `bash scripts/build-vm-image.sh` will now use the local pelagos build.
 
 ---
 
