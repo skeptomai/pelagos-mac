@@ -676,28 +676,41 @@ if busybox grep -q '^rootfs / rootfs' /proc/mounts 2>/dev/null; then
         echo "[pelagos-init] pass 1: /dev/vda has no ext4 filesystem — will format"
         NEEDS_FORMAT=1
         NEEDS_COPY=1
-    elif busybox mount -t ext4 /dev/vda /newroot 2>/dev/null; then
-        # If the disk carries a non-pelagos label (e.g. "ubuntu-build"), it is an
-        # external rootfs managed by build-build-image.sh.  Skip the Alpine copy
-        # entirely and hand off directly to the disk's own /sbin/init (systemd).
+    else
+        # Check the disk label BEFORE mounting — busybox blkid returns empty output
+        # on an already-mounted device, so the label check MUST happen pre-mount.
         DISK_LABEL="\$(busybox blkid /dev/vda 2>/dev/null | busybox grep -o 'LABEL="[^"]*"' | busybox cut -d'"' -f2)"
         if [ -n "\$DISK_LABEL" ] && [ "\$DISK_LABEL" != "pelagos-root" ]; then
+            # External rootfs (e.g. ubuntu-build) — mount it, then hand off to
+            # the disk's own /sbin/init (systemd).  Skip all Alpine copy logic.
             echo "[pelagos-init] pass 1: external rootfs label='\$DISK_LABEL' — pivoting to disk's /sbin/init"
+            busybox mount -t ext4 /dev/vda /newroot || {
+                echo "[pelagos-init] FATAL: mount of external rootfs failed" >/dev/console
+                exec busybox sh
+            }
+            # Configure the network interface with the static IP before switch_root.
+            # Kernel networking persists across switch_root; this ensures the relay
+            # can reach the VM immediately, even if systemd-networkd takes time.
+            # Use ifconfig/route — they are in the busybox applet list; 'ip' is not.
+            busybox ifconfig eth0 192.168.105.2 netmask 255.255.255.0 up 2>/dev/null || true
+            busybox route add default gw 192.168.105.1 2>/dev/null || true
+            echo "[pelagos-init] pass 1: configured eth0 with 192.168.105.2/24"
             exec busybox switch_root /newroot /sbin/init
             echo "[pelagos-init] FATAL: switch_root to external rootfs failed" >/dev/console 2>&1
             exec busybox sh
-        fi
-        DISK_VERSION="\$(busybox cat /newroot/etc/pelagos-root-version 2>/dev/null || true)"
-        if [ "\$DISK_VERSION" = "\$EXPECTED_VERSION" ]; then
-            echo "[pelagos-init] pass 1: disk root is current (version=\$EXPECTED_VERSION)"
+        elif busybox mount -t ext4 /dev/vda /newroot 2>/dev/null; then
+            DISK_VERSION="\$(busybox cat /newroot/etc/pelagos-root-version 2>/dev/null || true)"
+            if [ "\$DISK_VERSION" = "\$EXPECTED_VERSION" ]; then
+                echo "[pelagos-init] pass 1: disk root is current (version=\$EXPECTED_VERSION)"
+            else
+                echo "[pelagos-init] pass 1: version mismatch (disk='\${DISK_VERSION:-none}' want='\$EXPECTED_VERSION') — refreshing"
+                NEEDS_COPY=1
+            fi
         else
-            echo "[pelagos-init] pass 1: version mismatch (disk='\${DISK_VERSION:-none}' want='\$EXPECTED_VERSION') — refreshing"
+            echo "[pelagos-init] pass 1: ext4 mount failed — will reformat"
+            NEEDS_FORMAT=1
             NEEDS_COPY=1
         fi
-    else
-        echo "[pelagos-init] pass 1: ext4 mount failed — will reformat"
-        NEEDS_FORMAT=1
-        NEEDS_COPY=1
     fi
 
     if [ "\$NEEDS_FORMAT" = "1" ]; then

@@ -273,15 +273,44 @@ Address=192.168.105.2/24
 Gateway=192.168.105.1
 DNS=8.8.8.8
 DNS=1.1.1.1
+# Keep any IP pre-configured by the initramfs so the relay can reach the
+# VM before networkd re-applies config.
+KeepConfiguration=static
 NETCFG
 
 # Enable services via symlinks — systemctl enable doesn't work without running
 # systemd, but symlink creation is equivalent and always works in a chroot.
 mkdir -p "\$MNT/etc/systemd/system/multi-user.target.wants"
-ln -sf /lib/systemd/system/systemd-networkd.service \
-    "\$MNT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
 ln -sf /lib/systemd/system/ssh.service \
     "\$MNT/etc/systemd/system/multi-user.target.wants/ssh.service" 2>/dev/null || true
+
+# Mask serial-getty@hvc0 — without this, systemd waits ~8 minutes for
+# /dev/hvc0 to appear (virtio_console is loaded but udev times out),
+# blocking the entire boot including network configuration.
+ln -sf /dev/null "\$MNT/etc/systemd/system/serial-getty@hvc0.service"
+
+# Mask systemd-networkd — the initramfs already configured eth0 with the
+# static IP (192.168.105.2/24) and default route before switch_root.
+# networkd starting at ~t=60s disrupts the interface briefly (re-applies
+# addresses, triggers ARP DAD, etc.), causing smoltcp's SYN packets to be
+# dropped silently for 40+ seconds per attempt.  The IP is stable without
+# networkd; there is no DHCP in this environment.
+ln -sf /dev/null "\$MNT/etc/systemd/system/systemd-networkd.service"
+
+# Mask systemd-resolved — without it, /etc/resolv.conf would be a dead
+# symlink pointing to resolved's stub socket, breaking all DNS lookups.
+ln -sf /dev/null "\$MNT/etc/systemd/system/systemd-resolved.service"
+
+# Static resolv.conf — plain file, not a symlink to the resolved stub.
+rm -f "\$MNT/etc/resolv.conf"
+printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "\$MNT/etc/resolv.conf"
+
+# Disable predictable interface renaming (belt-and-suspenders alongside
+# net.ifnames=0 in the kernel cmdline).  Without this, udev renames eth0
+# to enp0sN, bringing it down in the process and dropping the IP that the
+# initramfs configured before switch_root.
+mkdir -p "\$MNT/etc/udev/rules.d"
+ln -sf /dev/null "\$MNT/etc/udev/rules.d/80-net-setup-link.rules"
 
 # ---- SSH ----
 
@@ -300,6 +329,10 @@ echo "[provision] installing Rust stable toolchain"
 chroot "\$MNT" env HOME=/root \
     bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
              | sh -s -- -y --default-toolchain stable --no-modify-path'
+
+# Make rustc/cargo available system-wide for non-interactive SSH sessions.
+printf '%s\n' 'export PATH=$PATH:/root/.cargo/bin' > "\$MNT/etc/profile.d/rust.sh"
+chmod +x "\$MNT/etc/profile.d/rust.sh"
 
 # ---- cleanup ----
 
@@ -372,6 +405,10 @@ initrd    = $INITRD
 memory    = $MEMORY_MIB
 cpus      = $CPUS
 ping_mode = ssh
+# net.ifnames=0: prevent udev from renaming eth0 → enp0sN.
+# Without this, udev brings eth0 down to rename it, dropping the IP configured
+# by the initramfs before switch_root, leaving smoltcp unable to ARP the VM.
+cmdline   = console=hvc0 net.ifnames=0 nohz=off cpuidle.off=1
 VMCONF_EOF
 
 echo "  $PROFILE_STATE_DIR/vm.conf"
