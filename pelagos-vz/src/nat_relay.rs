@@ -313,6 +313,49 @@ fn pre_scan_frames(
     }
 }
 
+/// Construct and transmit a gratuitous ARP request ("who has VM_IP? tell GATEWAY_IP")
+/// directly to the relay fd (VM side of the socketpair).
+///
+/// Purpose: smoltcp's neighbor cache has a 60-second expiry (hardcoded in the library).
+/// Ubuntu's systemd-networkd starts managing eth0 at approximately the same time,
+/// creating a race where the ARP re-request arrives while the interface is briefly
+/// in flux.  Sending a keepalive every 45 s ensures the cache entry is refreshed
+/// *before* expiry, so the 60-second window never falls inside the networkd startup
+/// period.
+fn send_arp_keepalive(relay_fd: RawFd) {
+    const VM_IP: [u8; 4] = [192, 168, 105, 2];
+    const GW_IP: [u8; 4] = [192, 168, 105, 1];
+    let gw_mac = GATEWAY_MAC.0;
+
+    // 14-byte Ethernet header + 28-byte ARP payload = 42 bytes.
+    let mut f = [0u8; 42];
+
+    // Ethernet: broadcast dst, gateway src, Ethertype 0x0806 (ARP).
+    f[0..6].copy_from_slice(&[0xff; 6]);
+    f[6..12].copy_from_slice(&gw_mac);
+    f[12] = 0x08;
+    f[13] = 0x06;
+
+    // ARP: Ethernet / IPv4 / request.
+    f[14] = 0x00;
+    f[15] = 0x01; // HW type = Ethernet
+    f[16] = 0x08;
+    f[17] = 0x00; // Proto type = IPv4
+    f[18] = 6; // HW addr len
+    f[19] = 4; // Proto addr len
+    f[20] = 0x00;
+    f[21] = 0x01; // Operation = Request
+    f[22..28].copy_from_slice(&gw_mac); // sender MAC = gateway
+    f[28..32].copy_from_slice(&GW_IP); // sender IP  = gateway
+    f[32..38].copy_from_slice(&[0u8; 6]); // target MAC = unknown
+    f[38..42].copy_from_slice(&VM_IP); // target IP  = VM
+
+    unsafe {
+        libc::send(relay_fd, f.as_ptr() as _, f.len(), 0);
+    }
+    log::debug!("nat_relay: sent ARP keepalive for 192.168.105.2");
+}
+
 fn run_relay(relay_fd: RawFd, inbound_rx: Receiver<(TcpStream, u16)>) {
     let mut device = AvfDevice::new(relay_fd);
 
@@ -343,8 +386,27 @@ fn run_relay(relay_fd: RawFd, inbound_rx: Receiver<(TcpStream, u16)>) {
     let mut listeners: Vec<smoltcp::iface::SocketHandle> = vec![];
 
     // Inbound (macOS→VM): smoltcp connect sockets waiting to reach Established.
-    let mut inbound_pending: HashMap<smoltcp::iface::SocketHandle, TcpStream> = HashMap::new();
+    // Stores the macOS TcpStream and the insertion timestamp; stale entries
+    // (older than INBOUND_PENDING_TTL) are pruned unconditionally so that
+    // repeated ping_ssh retries during the boot ARP-resolution window don't
+    // accumulate zombie sockets that flood sshd once ARP resolves.
+    let mut inbound_pending: HashMap<
+        smoltcp::iface::SocketHandle,
+        (TcpStream, std::time::Instant),
+    > = HashMap::new();
+    /// Max age of a pending inbound smoltcp socket before it is aborted.
+    /// Slightly longer than ping_ssh's ConnectTimeout (30 s) so that a live
+    /// connection is never pruned while its ssh-relay-proxy is still running.
+    const INBOUND_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(40);
     let mut next_local_port: u16 = 49152;
+
+    // ARP keepalive: smoltcp's neighbor cache expires every 60 s.  Send a
+    // proactive ARP request to the VM every 45 s so the cache is always
+    // refreshed before the expiry window aligns with networkd startup.
+    const ARP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
+    let mut last_arp_keepalive = std::time::Instant::now()
+        .checked_sub(ARP_KEEPALIVE_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
 
     log::info!(
         "nat_relay: poll loop started (proxy_port={})",
@@ -377,10 +439,11 @@ fn run_relay(relay_fd: RawFd, inbound_rx: Receiver<(TcpStream, u16)>) {
                     };
                     if sock.connect(iface.context(), remote, local).is_ok() {
                         let handle = sockets.add(sock);
-                        inbound_pending.insert(handle, macos_sock);
-                        log::debug!(
-                            "nat_relay: inbound connect to 192.168.105.2:{}",
-                            container_port
+                        inbound_pending.insert(handle, (macos_sock, std::time::Instant::now()));
+                        log::info!(
+                            "nat_relay: inbound queued -> 192.168.105.2:{} (pending={})",
+                            container_port,
+                            inbound_pending.len()
                         );
                     }
                 }
@@ -389,13 +452,32 @@ fn run_relay(relay_fd: RawFd, inbound_rx: Receiver<(TcpStream, u16)>) {
             }
         }
 
-        // ---- Inbound pending: promote to active TcpConn once Established ----
+        // ---- Inbound pending: prune stale + promote Established ----
+        // Repeated ping_ssh retries during the boot ARP-resolution window each
+        // add a new smoltcp SYN_SENT socket.  When ARP finally resolves they
+        // all connect simultaneously, flooding sshd.  Prune any entry that has
+        // been waiting longer than INBOUND_PENDING_TTL (slightly longer than
+        // ping_ssh's ConnectTimeout=30s) — by that point ssh-relay-proxy has
+        // definitely exited and the entry is stale.
         let pending_handles: Vec<smoltcp::iface::SocketHandle> =
             inbound_pending.keys().copied().collect();
         for handle in pending_handles {
+            let age = inbound_pending[&handle].1.elapsed();
+            if age > INBOUND_PENDING_TTL {
+                inbound_pending.remove(&handle);
+                sockets.get_mut::<tcp::Socket>(handle).abort();
+                sockets.remove(handle);
+                log::info!("nat_relay: pruned stale inbound pending ({:.1?} old)", age);
+                continue;
+            }
+
             let sock = sockets.get_mut::<tcp::Socket>(handle);
             if sock.state() == tcp::State::Established {
-                let macos_sock = inbound_pending.remove(&handle).unwrap();
+                log::info!(
+                    "nat_relay: inbound pending -> established (age {:.1?})",
+                    age
+                );
+                let (macos_sock, _) = inbound_pending.remove(&handle).unwrap();
                 let (to_smol_tx, to_smol_rx) = mpsc::channel::<ProxyMsg>();
                 let (from_smol_tx, from_smol_rx) = mpsc::channel::<Vec<u8>>();
                 let tx2 = to_smol_tx.clone();
@@ -412,6 +494,10 @@ fn run_relay(relay_fd: RawFd, inbound_rx: Receiver<(TcpStream, u16)>) {
                     },
                 );
             } else if sock.state() == tcp::State::Closed || sock.state() == tcp::State::TimeWait {
+                log::info!(
+                    "nat_relay: inbound pending closed ({:?}, age {:.1?}) — port likely not open yet",
+                    sock.state(), age
+                );
                 inbound_pending.remove(&handle);
                 sockets.remove(handle);
             }
@@ -536,6 +622,13 @@ fn run_relay(relay_fd: RawFd, inbound_rx: Receiver<(TcpStream, u16)>) {
         for handle in to_remove {
             tcp_conns.remove(&handle);
             sockets.remove(handle);
+        }
+
+        // ARP keepalive: send a proactive ARP request before the 60 s smoltcp
+        // neighbor cache expires so the entry stays warm through networkd startup.
+        if last_arp_keepalive.elapsed() >= ARP_KEEPALIVE_INTERVAL {
+            send_arp_keepalive(device.relay_fd);
+            last_arp_keepalive = std::time::Instant::now();
         }
 
         let delay = iface

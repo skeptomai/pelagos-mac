@@ -54,6 +54,9 @@ pub struct VmProfileConfig {
     pub cpus: Option<usize>,
     /// How `pelagos ping` checks VM readiness. Default: `vsock`.
     pub ping_mode: PingMode,
+    /// Override the kernel cmdline. When set, replaces the `--cmdline` default
+    /// (`console=hvc0`). The `clock.utc=` token is still appended by the daemon.
+    pub cmdline: Option<String>,
 }
 
 impl VmProfileConfig {
@@ -93,6 +96,7 @@ impl VmProfileConfig {
                         _ => PingMode::Vsock,
                     }
                 }
+                "cmdline" => cfg.cmdline = Some(val.to_string()),
                 _ => {}
             }
         }

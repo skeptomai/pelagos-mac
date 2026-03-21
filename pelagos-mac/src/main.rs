@@ -1068,8 +1068,10 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     // init reads it and calls: busybox date -s "YYYY-MM-DD HH:MM:SS".
     // Skip injection if clock.utc is already present (e.g., inside vm-daemon-internal
     // subprocess which receives the cmdline forwarded from the parent process).
-    let cmdline = if cli.cmdline.contains("clock.utc=") {
-        cli.cmdline.clone()
+    // vm.conf cmdline overrides the CLI default when set.
+    let base_cmdline = profile_cfg.cmdline.as_deref().unwrap_or(&cli.cmdline);
+    let cmdline = if base_cmdline.contains("clock.utc=") {
+        base_cmdline.to_string()
     } else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1097,7 +1099,7 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
             year, month, day, hours, mins, secs
         );
-        format!("{} clock.utc={}", cli.cmdline, clock_utc)
+        format!("{} clock.utc={}", base_cmdline, clock_utc)
     };
 
     daemon::DaemonArgs {
@@ -1807,9 +1809,17 @@ fn ping_ssh(cli: &Cli) -> i32 {
         profile,
         VM_SSH_PORT
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(600);
+    let mut attempt = 0u32;
     loop {
-        let ok = std::process::Command::new("ssh")
+        attempt += 1;
+        let elapsed = start.elapsed().as_secs();
+        eprint!("\r[ping] attempt {} ({}s elapsed) ...", attempt, elapsed);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+
+        // Capture SSH stderr for progress diagnostics.
+        let out = std::process::Command::new("ssh")
             .arg("-i")
             .arg(&ssh_key)
             .arg("-o")
@@ -1819,25 +1829,37 @@ fn ping_ssh(cli: &Cli) -> i32 {
             .arg("-o")
             .arg("LogLevel=ERROR")
             .arg("-o")
-            .arg("ConnectTimeout=5")
+            .arg("ConnectTimeout=30")
             .arg("-o")
             .arg(format!("ProxyCommand={}", proxy_cmd))
             .arg("root@vm")
             .arg("true")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .stderr(std::process::Stdio::piped())
+            .output();
+        let ok = out.as_ref().map(|o| o.status.success()).unwrap_or(false);
         if ok {
+            eprintln!(); // newline after progress
             println!("pong");
             return 0;
         }
+        // Print SSH's error message so failures are immediately visible.
+        if let Ok(ref o) = out {
+            let msg = String::from_utf8_lossy(&o.stderr);
+            let msg = msg.trim();
+            if !msg.is_empty() {
+                eprint!("\r[ping] attempt {} ({}s): {}\n", attempt, elapsed, msg);
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+        }
         if std::time::Instant::now() >= deadline {
-            log::error!("SSH ping timed out after 5 minutes");
+            eprintln!();
+            log::error!("SSH ping timed out after 10 minutes");
             return 1;
         }
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Wait between retries. A longer gap (15s vs 5s) reduces stale smoltcp
+        // connection accumulation during the boot window when ARP is not yet ready.
+        std::thread::sleep(std::time::Duration::from_secs(15));
     }
 }
 
