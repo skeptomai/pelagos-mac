@@ -41,6 +41,9 @@ pub struct VmConfig {
     pub cmdline: String,
     /// Root disk image (raw).
     pub disk: PathBuf,
+    /// Additional disk images attached as secondary virtio-blk devices.
+    /// First entry → /dev/vdb, second → /dev/vdc, etc.
+    pub extra_disks: Vec<PathBuf>,
     /// Number of vCPUs.
     pub cpus: usize,
     /// Memory in MiB.
@@ -65,6 +68,7 @@ pub struct VmConfigBuilder {
     initrd: Option<PathBuf>,
     cmdline: Option<String>,
     disk: Option<PathBuf>,
+    extra_disks: Vec<PathBuf>,
     cpus: Option<usize>,
     memory_mib: Option<usize>,
     vsock_port: Option<u32>,
@@ -87,6 +91,10 @@ impl VmConfigBuilder {
     }
     pub fn disk(mut self, p: impl Into<PathBuf>) -> Self {
         self.disk = Some(p.into());
+        self
+    }
+    pub fn extra_disk(mut self, p: impl Into<PathBuf>) -> Self {
+        self.extra_disks.push(p.into());
         self
     }
     pub fn cpus(mut self, n: usize) -> Self {
@@ -124,6 +132,7 @@ impl VmConfigBuilder {
                 .cmdline
                 .unwrap_or_else(|| "console=hvc0 root=/dev/vda rw".into()),
             disk: self.disk.ok_or("disk required")?,
+            extra_disks: self.extra_disks,
             cpus: self.cpus.unwrap_or(2),
             memory_mib: self.memory_mib.unwrap_or(1024),
             vsock_port: self.vsock_port.unwrap_or(1024),
@@ -380,22 +389,30 @@ unsafe fn start_vm(config: VmConfig) -> Result<(Vm, std::os::unix::io::OwnedFd),
     vm_config.setPlatform(platform_ref);
 
     // 4. Virtio block storage.
-    let disk_url = file_url(&config.disk);
-    // Open read-only: the placeholder disk is never written to from init.
-    // Read-only avoids an exclusive lock that would prevent concurrent or
-    // rapid back-to-back VMs from attaching the same image file.
-    let disk_attach = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
-        VZDiskImageStorageDeviceAttachment::alloc(),
-        &disk_url,
-        false, // read-write so the guest can format and persist the OCI image cache
-    )
-    .map_err(|e| crate::Error::Config(e.localizedDescription().to_string()))?;
-    let block_dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
-        VZVirtioBlockDeviceConfiguration::alloc(),
-        &disk_attach,
-    );
-    let storage_ref: &VZStorageDeviceConfiguration = &block_dev;
-    vm_config.setStorageDevices(&NSArray::from_slice(&[storage_ref]));
+    // Build all disk configs (root + any extra disks) into a Vec so every
+    // Retained handle stays alive across NSArray::from_slice + setStorageDevices.
+    // Root disk → /dev/vda; extra disks → /dev/vdb, /dev/vdc, …
+    // (Same lifetime pattern as the virtiofs shares section below.)
+    let mut block_devs: Vec<Retained<VZVirtioBlockDeviceConfiguration>> = Vec::new();
+    for disk_path in std::iter::once(&config.disk).chain(config.extra_disks.iter()) {
+        let url = file_url(disk_path);
+        let attach = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+            VZDiskImageStorageDeviceAttachment::alloc(),
+            &url,
+            false,
+        )
+        .map_err(|e| crate::Error::Config(e.localizedDescription().to_string()))?;
+        let blk = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+            VZVirtioBlockDeviceConfiguration::alloc(),
+            &attach,
+        );
+        block_devs.push(blk);
+    }
+    let storage_refs: Vec<&VZStorageDeviceConfiguration> = block_devs
+        .iter()
+        .map(|d| d as &VZStorageDeviceConfiguration)
+        .collect();
+    vm_config.setStorageDevices(&NSArray::from_slice(&storage_refs));
 
     // 5. Userspace NAT relay via VZFileHandleNetworkDeviceAttachment.
     //    Starts the smoltcp-based NAT relay (replaces socket_vmnet / vmnet.framework).

@@ -93,6 +93,9 @@ pub struct DaemonArgs {
     pub port_forwards: Vec<PortForward>,
     /// VM profile name ("default" or a named profile).
     pub profile: String,
+    /// Secondary disk images: first → /dev/vdb, second → /dev/vdc, etc.
+    /// Used during build-VM provisioning to avoid virtiofs I/O overhead.
+    pub extra_disks: Vec<std::path::PathBuf>,
 }
 
 /// Ensure the daemon is running, starting it if necessary.
@@ -111,6 +114,17 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "daemon is running with different mount configuration; \
+                 run 'pelagos vm stop' first, then retry",
+            ));
+        }
+        // Extra disks are block devices attached at VM boot; they cannot be
+        // changed on a running VM.  Verify the running daemon was started with
+        // the same set (persisted in vm.extra_disks by daemon::run()).
+        let running_extra = state.read_extra_disks()?;
+        if running_extra != args.extra_disks {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "daemon is running with different extra-disk configuration; \
                  run 'pelagos vm stop' first, then retry",
             ));
         }
@@ -140,30 +154,9 @@ pub fn ensure_running(args: &DaemonArgs) -> io::Result<()> {
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(&exe);
-    if args.profile != "default" {
-        cmd.arg("--profile").arg(&args.profile);
+    for arg in daemon_subprocess_args(args) {
+        cmd.arg(arg);
     }
-    cmd.arg("--kernel").arg(&args.kernel);
-    cmd.arg("--disk").arg(&args.disk);
-    if let Some(ref initrd) = args.initrd {
-        cmd.arg("--initrd").arg(initrd);
-    }
-    cmd.arg("--cmdline").arg(&args.cmdline);
-    cmd.arg("--memory").arg(args.memory_mib.to_string());
-    cmd.arg("--cpus").arg(args.cpus.to_string());
-    // Forward virtiofs shares as repeated --volume flags to the daemon subcommand.
-    for share in &args.virtiofs_shares {
-        let mut spec = format!("{}:{}", share.host_path.display(), share.container_path);
-        if share.read_only {
-            spec.push_str(":ro");
-        }
-        cmd.arg("--volume").arg(&spec);
-    }
-    for pf in &args.port_forwards {
-        cmd.arg("--port")
-            .arg(format!("{}:{}", pf.host_port, pf.container_port));
-    }
-    cmd.arg("vm-daemon-internal");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     // Always write daemon stderr to a log file so failures are diagnosable
@@ -247,7 +240,7 @@ pub fn run(args: DaemonArgs) -> ! {
         log::error!("write pid: {}", e);
     });
 
-    // Persist mount and port configuration.
+    // Persist mount, port, and extra-disk configuration.
     state
         .write_mounts(&args.virtiofs_shares)
         .unwrap_or_else(|e| {
@@ -256,6 +249,11 @@ pub fn run(args: DaemonArgs) -> ! {
     state.write_ports(&args.port_forwards).unwrap_or_else(|e| {
         log::error!("write ports: {}", e);
     });
+    state
+        .write_extra_disks(&args.extra_disks)
+        .unwrap_or_else(|e| {
+            log::error!("write extra_disks: {}", e);
+        });
 
     // Start a TCP proxy thread for each requested port forward.
     for pf in &args.port_forwards {
@@ -473,6 +471,51 @@ fn tcp_proxy(client: TcpStream, server: TcpStream) {
 // VmConfig from DaemonArgs
 // ---------------------------------------------------------------------------
 
+/// Build the argument list for the `vm-daemon-internal` subprocess.
+///
+/// Returns only the *arguments* (not the executable path).  Extracted as a
+/// pure function so the subprocess arg serialization can be unit-tested
+/// without spawning a real process.
+pub(crate) fn daemon_subprocess_args(args: &DaemonArgs) -> Vec<std::ffi::OsString> {
+    let mut v: Vec<std::ffi::OsString> = Vec::new();
+    if args.profile != "default" {
+        v.push("--profile".into());
+        v.push((&args.profile).into());
+    }
+    v.push("--kernel".into());
+    v.push(args.kernel.as_os_str().into());
+    v.push("--disk".into());
+    v.push(args.disk.as_os_str().into());
+    if let Some(ref initrd) = args.initrd {
+        v.push("--initrd".into());
+        v.push(initrd.as_os_str().into());
+    }
+    v.push("--cmdline".into());
+    v.push(args.cmdline.as_str().into());
+    v.push("--memory".into());
+    v.push(args.memory_mib.to_string().into());
+    v.push("--cpus".into());
+    v.push(args.cpus.to_string().into());
+    for share in &args.virtiofs_shares {
+        let mut spec = format!("{}:{}", share.host_path.display(), share.container_path);
+        if share.read_only {
+            spec.push_str(":ro");
+        }
+        v.push("--volume".into());
+        v.push(spec.into());
+    }
+    for pf in &args.port_forwards {
+        v.push("--port".into());
+        v.push(format!("{}:{}", pf.host_port, pf.container_port).into());
+    }
+    for path in &args.extra_disks {
+        v.push("--extra-disk".into());
+        v.push(path.as_os_str().into());
+    }
+    v.push("vm-daemon-internal".into());
+    v
+}
+
 fn build_vm_config(args: &DaemonArgs) -> VmConfig {
     let mut b = VmConfig::builder()
         .kernel(&args.kernel)
@@ -485,6 +528,9 @@ fn build_vm_config(args: &DaemonArgs) -> VmConfig {
     }
     for share in &args.virtiofs_shares {
         b = b.virtiofs(&share.host_path, &share.tag, share.read_only);
+    }
+    for path in &args.extra_disks {
+        b = b.extra_disk(path);
     }
     b.build().expect("vm config")
 }
@@ -626,7 +672,8 @@ fn proxy_console(client: UnixStream, relay_fd: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_cmdline_from_parts, mounts_match, parse_port_spec, PortForward, VirtiofsShare,
+        build_cmdline_from_parts, daemon_subprocess_args, mounts_match, parse_port_spec,
+        DaemonArgs, PortForward, VirtiofsShare,
     };
     use std::path::PathBuf;
 
@@ -737,5 +784,75 @@ mod tests {
         assert!(parse_port_spec("notaport").is_none());
         assert!(parse_port_spec("abc:def").is_none());
         assert!(parse_port_spec("99999:80").is_none()); // u16 overflow
+    }
+
+    fn base_args() -> DaemonArgs {
+        DaemonArgs {
+            kernel: PathBuf::from("/out/vmlinuz"),
+            initrd: None,
+            disk: PathBuf::from("/out/root.img"),
+            cmdline: "console=hvc0".into(),
+            memory_mib: 4096,
+            cpus: 2,
+            virtiofs_shares: vec![],
+            port_forwards: vec![],
+            profile: "default".into(),
+            extra_disks: vec![],
+        }
+    }
+
+    #[test]
+    fn subprocess_args_no_extra_disks() {
+        let args = base_args();
+        let v = daemon_subprocess_args(&args);
+        assert!(!v.contains(&"--extra-disk".into()));
+        assert!(v.contains(&"vm-daemon-internal".into()));
+    }
+
+    #[test]
+    fn subprocess_args_one_extra_disk() {
+        let mut args = base_args();
+        args.extra_disks.push(PathBuf::from("/out/build.img"));
+        let v = daemon_subprocess_args(&args);
+        let idx = v
+            .iter()
+            .position(|a| a == "--extra-disk")
+            .expect("--extra-disk missing");
+        assert_eq!(v[idx + 1], std::ffi::OsStr::new("/out/build.img"));
+    }
+
+    #[test]
+    fn subprocess_args_two_extra_disks() {
+        let mut args = base_args();
+        args.extra_disks.push(PathBuf::from("/out/build.img"));
+        args.extra_disks.push(PathBuf::from("/out/data.img"));
+        let v = daemon_subprocess_args(&args);
+        let count = v.iter().filter(|a| *a == "--extra-disk").count();
+        assert_eq!(count, 2);
+        // Verify order: build.img before data.img
+        let first = v.iter().position(|a| a == "--extra-disk").unwrap();
+        assert_eq!(v[first + 1], std::ffi::OsStr::new("/out/build.img"));
+    }
+
+    #[test]
+    fn subprocess_args_extra_disk_before_subcommand() {
+        let mut args = base_args();
+        args.extra_disks.push(PathBuf::from("/out/build.img"));
+        let v = daemon_subprocess_args(&args);
+        let disk_idx = v.iter().position(|a| a == "--extra-disk").unwrap();
+        let sub_idx = v.iter().position(|a| a == "vm-daemon-internal").unwrap();
+        assert!(disk_idx < sub_idx);
+    }
+
+    #[test]
+    fn subprocess_args_named_profile_emits_flag() {
+        let mut args = base_args();
+        args.profile = "build".into();
+        let v = daemon_subprocess_args(&args);
+        let idx = v
+            .iter()
+            .position(|a| a == "--profile")
+            .expect("--profile missing");
+        assert_eq!(v[idx + 1], std::ffi::OsStr::new("build"));
     }
 }

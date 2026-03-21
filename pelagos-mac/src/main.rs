@@ -45,13 +45,13 @@ struct Cli {
     #[arg(long, env = "PELAGOS_CMDLINE", default_value = "console=hvc0")]
     cmdline: String,
 
-    /// Memory in MiB (default 4096)
-    #[arg(long, default_value = "4096")]
-    memory: usize,
+    /// Memory in MiB (default 4096; overridden by vm.conf memory= in profile)
+    #[arg(long)]
+    memory: Option<usize>,
 
-    /// Number of vCPUs (default 2)
-    #[arg(long, default_value = "2")]
-    cpus: usize,
+    /// Number of vCPUs (default 2; overridden by vm.conf cpus= in profile)
+    #[arg(long)]
+    cpus: Option<usize>,
 
     /// Bind-mount a host directory into the container: /host/path:/container/path[:ro]
     /// May be specified multiple times.
@@ -62,6 +62,13 @@ struct Cli {
     /// May be specified multiple times.
     #[arg(short = 'p', long = "port", global = true)]
     ports: Vec<String>,
+
+    /// Attach an extra disk image as an additional virtio-blk device.
+    /// First extra disk → /dev/vdb, second → /dev/vdc, etc.
+    /// Used by build-build-image.sh for provisioning without virtiofs I/O overhead.
+    /// May be specified multiple times.
+    #[arg(long = "extra-disk", global = true)]
+    extra_disks: Vec<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -706,6 +713,10 @@ fn main() {
                 log::error!("failed to start VM daemon: {}", e);
                 process::exit(1);
             }
+            let profile_cfg = state::VmProfileConfig::load(&profile).unwrap_or_default();
+            if profile_cfg.ping_mode == state::PingMode::Ssh {
+                process::exit(ping_ssh(&cli));
+            }
             let stream = connect_or_exit(&profile);
             process::exit(ping_command(stream));
         }
@@ -1011,12 +1022,19 @@ fn ssh_relay_proxy(port: u16) -> ! {
 }
 
 fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
-    let kernel = cli.kernel.clone().unwrap_or_else(|| {
-        log::error!("--kernel / PELAGOS_KERNEL is required");
-        process::exit(1);
-    });
-    let disk = cli.disk.clone().unwrap_or_else(|| {
-        log::error!("--disk / PELAGOS_DISK is required");
+    // Load per-profile vm.conf as a fallback layer below CLI flags.
+    let profile_cfg = state::VmProfileConfig::load(&cli.profile).unwrap_or_default();
+
+    let kernel = cli
+        .kernel
+        .clone()
+        .or(profile_cfg.kernel)
+        .unwrap_or_else(|| {
+            log::error!("--kernel / PELAGOS_KERNEL is required (or set kernel= in vm.conf)");
+            process::exit(1);
+        });
+    let disk = cli.disk.clone().or(profile_cfg.disk).unwrap_or_else(|| {
+        log::error!("--disk / PELAGOS_DISK is required (or set disk= in vm.conf)");
         process::exit(1);
     });
 
@@ -1050,8 +1068,10 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
     // init reads it and calls: busybox date -s "YYYY-MM-DD HH:MM:SS".
     // Skip injection if clock.utc is already present (e.g., inside vm-daemon-internal
     // subprocess which receives the cmdline forwarded from the parent process).
-    let cmdline = if cli.cmdline.contains("clock.utc=") {
-        cli.cmdline.clone()
+    // vm.conf cmdline overrides the CLI default when set.
+    let base_cmdline = profile_cfg.cmdline.as_deref().unwrap_or(&cli.cmdline);
+    let cmdline = if base_cmdline.contains("clock.utc=") {
+        base_cmdline.to_string()
     } else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1079,19 +1099,20 @@ fn daemon_args_from_cli(cli: &Cli) -> daemon::DaemonArgs {
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
             year, month, day, hours, mins, secs
         );
-        format!("{} clock.utc={}", cli.cmdline, clock_utc)
+        format!("{} clock.utc={}", base_cmdline, clock_utc)
     };
 
     daemon::DaemonArgs {
         kernel,
-        initrd: cli.initrd.clone(),
+        initrd: cli.initrd.clone().or(profile_cfg.initrd),
         disk,
         cmdline,
-        memory_mib: cli.memory,
-        cpus: cli.cpus,
+        memory_mib: cli.memory.or(profile_cfg.memory).unwrap_or(4096),
+        cpus: cli.cpus.or(profile_cfg.cpus).unwrap_or(2),
         virtiofs_shares,
         port_forwards,
         profile: cli.profile.clone(),
+        extra_disks: cli.extra_disks.clone(),
     }
 }
 
@@ -1763,6 +1784,85 @@ fn ping_command(stream: UnixStream) -> i32 {
     }
 }
 
+/// Ping a non-pelagos VM (e.g. Ubuntu build VM) by waiting for SSH to respond.
+/// The daemon is already running when this is called; we just retry SSH until
+/// it accepts a connection, then print "pong".  Retries for up to 5 minutes.
+fn ping_ssh(cli: &Cli) -> i32 {
+    let profile = &cli.profile;
+    let ssh_key = match state::global_ssh_key_file() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("SSH key: {}", e);
+            return 1;
+        }
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("current_exe: {}", e);
+            return 1;
+        }
+    };
+    let proxy_cmd = format!(
+        "{} --profile {} ssh-relay-proxy {}",
+        exe.display(),
+        profile,
+        VM_SSH_PORT
+    );
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(600);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let elapsed = start.elapsed().as_secs();
+        eprint!("\r[ping] attempt {} ({}s elapsed) ...", attempt, elapsed);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+
+        // Capture SSH stderr for progress diagnostics.
+        let out = std::process::Command::new("ssh")
+            .arg("-i")
+            .arg(&ssh_key)
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("ConnectTimeout=30")
+            .arg("-o")
+            .arg(format!("ProxyCommand={}", proxy_cmd))
+            .arg("root@vm")
+            .arg("true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        let ok = out.as_ref().map(|o| o.status.success()).unwrap_or(false);
+        if ok {
+            eprintln!(); // newline after progress
+            println!("pong");
+            return 0;
+        }
+        // Print SSH's error message so failures are immediately visible.
+        if let Ok(ref o) = out {
+            let msg = String::from_utf8_lossy(&o.stderr);
+            let msg = msg.trim();
+            if !msg.is_empty() {
+                eprint!("\r[ping] attempt {} ({}s): {}\n", attempt, elapsed, msg);
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!();
+            log::error!("SSH ping timed out after 10 minutes");
+            return 1;
+        }
+        // Wait between retries. A longer gap (15s vs 5s) reduces stale smoltcp
+        // connection accumulation during the boot window when ARP is not yet ready.
+        std::thread::sleep(std::time::Duration::from_secs(15));
+    }
+}
+
 /// Run an exec command: send the exec JSON handshake, read ready ack, then
 /// switch to framed binary protocol forwarding stdin/stdout/stderr.
 /// Send an exec-style command (Exec or Shell) and handle the binary frame protocol.
@@ -2175,6 +2275,7 @@ mod tests {
     };
     use clap::Parser as _;
     use std::io::Cursor;
+    use std::path::PathBuf;
 
     #[test]
     fn pong_deserializes() {
@@ -2382,6 +2483,43 @@ mod tests {
         assert!(!shares[1].read_only);
         assert_eq!(shares[0].tag, "share0");
         assert_eq!(shares[1].tag, "share1");
+    }
+
+    #[test]
+    fn cli_extra_disk_parses() {
+        let cli = Cli::try_parse_from([
+            "pelagos",
+            "--extra-disk",
+            "/out/build.img",
+            "--kernel",
+            "/out/vmlinuz",
+            "--disk",
+            "/out/root.img",
+            "ping",
+        ])
+        .unwrap();
+        assert_eq!(cli.extra_disks, vec![PathBuf::from("/out/build.img")]);
+    }
+
+    #[test]
+    fn cli_extra_disk_multiple() {
+        let cli = Cli::try_parse_from([
+            "pelagos",
+            "--extra-disk",
+            "/out/a.img",
+            "--extra-disk",
+            "/out/b.img",
+            "--kernel",
+            "/out/vmlinuz",
+            "--disk",
+            "/out/root.img",
+            "ping",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.extra_disks,
+            vec![PathBuf::from("/out/a.img"), PathBuf::from("/out/b.img")]
+        );
     }
 
     // ---------------------------------------------------------------------------

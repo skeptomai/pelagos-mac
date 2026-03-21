@@ -13,6 +13,95 @@ pub struct StateDir {
     pub mounts_file: PathBuf,
     /// Active port forwards for the running daemon (JSON).
     pub ports_file: PathBuf,
+    /// Extra block device paths attached at boot (JSON).
+    pub extra_disks_file: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Per-profile VM configuration
+// ---------------------------------------------------------------------------
+
+/// Per-profile VM configuration loaded from `vm.conf` in the profile state
+/// directory.  All fields are optional; absent fields fall back to CLI flags
+/// (or their own defaults).
+///
+/// File format: simple `key = value` lines; `#` comments; blank lines ignored.
+///
+/// ```text
+/// # vm.conf — written by build-build-image.sh
+/// disk   = /path/to/build.img
+/// kernel = /path/to/vmlinuz
+/// initrd = /path/to/initramfs.gz
+/// memory = 4096
+/// cpus   = 4
+/// ```
+/// How `pelagos ping` checks VM readiness.
+#[derive(Debug, Default, PartialEq, Clone)]
+pub enum PingMode {
+    /// Send a vsock ping to pelagos-guest (Alpine / container VM). Default.
+    #[default]
+    Vsock,
+    /// Wait for SSH to be available (Ubuntu / non-pelagos OS profiles).
+    Ssh,
+}
+
+#[derive(Debug, Default)]
+pub struct VmProfileConfig {
+    pub disk: Option<PathBuf>,
+    pub kernel: Option<PathBuf>,
+    pub initrd: Option<PathBuf>,
+    pub memory: Option<usize>,
+    pub cpus: Option<usize>,
+    /// How `pelagos ping` checks VM readiness. Default: `vsock`.
+    pub ping_mode: PingMode,
+    /// Override the kernel cmdline. When set, replaces the `--cmdline` default
+    /// (`console=hvc0`). The `clock.utc=` token is still appended by the daemon.
+    pub cmdline: Option<String>,
+}
+
+impl VmProfileConfig {
+    /// Load `vm.conf` from the given profile's state directory.
+    /// Returns a zeroed config (all `None`) if the file does not exist.
+    pub fn load(profile: &str) -> io::Result<Self> {
+        let path = profile_dir(profile)?.join("vm.conf");
+        Self::load_path(&path)
+    }
+
+    fn load_path(path: &std::path::Path) -> io::Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
+        let mut cfg = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "disk" => cfg.disk = Some(PathBuf::from(val)),
+                "kernel" => cfg.kernel = Some(PathBuf::from(val)),
+                "initrd" => cfg.initrd = Some(PathBuf::from(val)),
+                "memory" => cfg.memory = val.parse::<usize>().ok(),
+                "cpus" => cfg.cpus = val.parse::<usize>().ok(),
+                "ping_mode" => {
+                    cfg.ping_mode = match val {
+                        "ssh" => PingMode::Ssh,
+                        _ => PingMode::Vsock,
+                    }
+                }
+                "cmdline" => cfg.cmdline = Some(val.to_string()),
+                _ => {}
+            }
+        }
+        Ok(cfg)
+    }
 }
 
 impl StateDir {
@@ -35,6 +124,7 @@ impl StateDir {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
+            extra_disks_file: base.join("vm.extra_disks"),
         })
     }
 
@@ -84,6 +174,33 @@ impl StateDir {
         }
     }
 
+    /// Write the extra block device paths for the running daemon as JSON.
+    pub fn write_extra_disks(&self, paths: &[PathBuf]) -> io::Result<()> {
+        let strs: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let json = serde_json::to_string(&strs)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = self.extra_disks_file.with_extension("extra_disks.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &self.extra_disks_file)
+    }
+
+    /// Read the running daemon's extra disk paths.  Returns an empty Vec if
+    /// the file does not exist.
+    pub fn read_extra_disks(&self) -> io::Result<Vec<PathBuf>> {
+        match std::fs::read_to_string(&self.extra_disks_file) {
+            Ok(s) => {
+                let strs: Vec<String> = serde_json::from_str(&s)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(strs.into_iter().map(PathBuf::from).collect())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Write the current daemon's port forward configuration as JSON.
     pub fn write_ports(&self, ports: &[crate::daemon::PortForward]) -> io::Result<()> {
         let json = serde_json::to_string(ports)
@@ -105,13 +222,14 @@ impl StateDir {
         }
     }
 
-    /// Remove PID, socket, console socket, mounts, and ports files. Best-effort.
+    /// Remove PID, socket, console socket, mounts, ports, and extra_disks files. Best-effort.
     pub fn clear(&self) {
         let _ = std::fs::remove_file(&self.pid_file);
         let _ = std::fs::remove_file(&self.sock_file);
         let _ = std::fs::remove_file(&self.console_sock_file);
         let _ = std::fs::remove_file(&self.mounts_file);
         let _ = std::fs::remove_file(&self.ports_file);
+        let _ = std::fs::remove_file(&self.extra_disks_file);
     }
 }
 
@@ -172,6 +290,7 @@ mod tests {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
+            extra_disks_file: base.join("vm.extra_disks"),
         }
     }
 
@@ -276,6 +395,7 @@ mod tests {
             console_sock_file: base.join("console.sock"),
             mounts_file: base.join("vm.mounts"),
             ports_file: base.join("vm.ports"),
+            extra_disks_file: base.join("vm.extra_disks"),
         };
         assert_eq!(s.pid_file, PathBuf::from("/tmp/pelagos-path-test/vm.pid"));
         assert_eq!(s.sock_file, PathBuf::from("/tmp/pelagos-path-test/vm.sock"));
@@ -312,6 +432,46 @@ mod tests {
             PathBuf::from("/tmp/pelagos-xdg-test/pelagos/profiles/build")
         );
         std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    /// VmProfileConfig parses a vm.conf file correctly.
+    #[test]
+    fn vm_profile_config_parse() {
+        use std::io::Write;
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("pelagos-conf-test-{}", ns));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf_path = dir.join("vm.conf");
+        let mut f = std::fs::File::create(&conf_path).unwrap();
+        writeln!(f, "# comment").unwrap();
+        writeln!(f, "disk   = /data/build.img").unwrap();
+        writeln!(f, "kernel = /boot/vmlinuz").unwrap();
+        writeln!(f, "initrd = /boot/initrd.gz").unwrap();
+        writeln!(f, "memory = 8192").unwrap();
+        writeln!(f, "cpus   = 4").unwrap();
+        writeln!(f, "unknown = ignored").unwrap();
+        drop(f);
+
+        let cfg = super::VmProfileConfig::load_path(&conf_path).unwrap();
+        assert_eq!(cfg.disk, Some(PathBuf::from("/data/build.img")));
+        assert_eq!(cfg.kernel, Some(PathBuf::from("/boot/vmlinuz")));
+        assert_eq!(cfg.initrd, Some(PathBuf::from("/boot/initrd.gz")));
+        assert_eq!(cfg.memory, Some(8192));
+        assert_eq!(cfg.cpus, Some(4));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// VmProfileConfig returns all-None when vm.conf is absent.
+    #[test]
+    fn vm_profile_config_missing_returns_default() {
+        let absent = PathBuf::from("/tmp/pelagos-no-such-conf-file.conf");
+        let cfg = super::VmProfileConfig::load_path(&absent).unwrap();
+        assert!(cfg.disk.is_none());
+        assert!(cfg.memory.is_none());
     }
 
     /// default and named profiles use distinct state directories.

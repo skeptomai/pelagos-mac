@@ -70,6 +70,49 @@ Stored in `~/.local/share/pelagos/` (respects `$XDG_DATA_HOME`):
 
 ---
 
+## VM profiles and control planes
+
+A VM profile is a named configuration (kernel + disk + memory + cpus) stored in
+`~/.local/share/pelagos/profiles/<name>/vm.conf`. The default profile runs the
+Alpine pelagos VM. Named profiles can run entirely different operating systems.
+
+The **control plane** differs by OS, and this affects which `pelagos` commands
+work:
+
+| | Alpine VM (default) | Ubuntu build VM (`--profile build`) |
+|---|---|---|
+| Control plane | vsock → pelagos-guest | SSH → openssh-server |
+| `pelagos ping` | vsock pong from pelagos-guest | SSH connectivity check |
+| `pelagos vm ssh` | works (smoltcp relay) | works (smoltcp relay) |
+| `pelagos run/exec/ps` | works | N/A — no containers |
+| smoltcp NAT relay | outbound + SSH inbound | outbound + SSH inbound |
+| Purpose | run containers | native aarch64 build/test |
+
+### ping_mode
+
+`vm.conf` accepts a `ping_mode` key (`vsock` or `ssh`):
+
+```
+ping_mode = ssh
+```
+
+When `ping_mode = ssh`, `pelagos ping` starts the VM daemon (for the smoltcp
+relay) then waits for SSH to be available, printing `pong` on success. This
+makes `pelagos ping`, `vm-ping.sh`, and `vm-restart.sh` work correctly for
+Ubuntu profiles without modification.
+
+Default is `vsock` (Alpine behaviour, backwards-compatible).
+
+### Why pelagos-guest is absent from the Ubuntu build VM
+
+pelagos-guest is the vsock server that handles container commands (run, exec,
+ps, etc.). The Ubuntu build VM has no containers — its sole purpose is native
+aarch64 Linux compilation. systemd-networkd + openssh-server is the entire
+control plane needed. vsock drivers are present in the kernel but nothing
+listens on them.
+
+---
+
 ## e2e test interaction
 
 `scripts/test-devcontainer-e2e.sh` runs 27 tests across suites A–F.
