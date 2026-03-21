@@ -257,7 +257,7 @@ chroot "\$MNT" apt-get update -qq
 chroot "\$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     build-essential git curl wget ca-certificates \
     iproute2 nftables openssh-server \
-    systemd systemd-sysv \
+    systemd systemd-sysv systemd-timesyncd \
     pkg-config libssl-dev
 
 # ---- networking: systemd-networkd with static IP ----
@@ -330,9 +330,24 @@ chroot "\$MNT" env HOME=/root \
     bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
              | sh -s -- -y --default-toolchain stable --no-modify-path'
 
-# Make rustc/cargo available system-wide for non-interactive SSH sessions.
-printf '%s\n' 'export PATH=$PATH:/root/.cargo/bin' > "\$MNT/etc/profile.d/rust.sh"
+# Make rustc/cargo available system-wide for login and non-login shells.
+# Use '. /root/.cargo/env' rather than baking in $PATH — the OUTER_EOF heredoc
+# is unquoted so $PATH would expand to the macOS host PATH at provisioning time.
+printf '%s\n' '. /root/.cargo/env' > "\$MNT/etc/profile.d/rust.sh"
 chmod +x "\$MNT/etc/profile.d/rust.sh"
+
+# Append to root's .bashrc so non-login interactive shells also get cargo.
+printf '\n# Rust toolchain\nsource /root/.cargo/env\n' >> "\$MNT/root/.bashrc"
+
+# git needs an explicit CA bundle path on Ubuntu 22.04 — without this, git
+# reports "CAfile: none" even though ca-certificates is installed.
+chroot "\$MNT" git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+
+# Sync the system clock on boot via systemd-timesyncd (NTP).
+# Without this the VM clock is frozen at image-build time, causing TLS
+# certificate verification failures for git and cargo.
+ln -sf /lib/systemd/system/systemd-timesyncd.service \
+    "\$MNT/etc/systemd/system/multi-user.target.wants/systemd-timesyncd.service" 2>/dev/null || true
 
 # ---- cleanup ----
 
